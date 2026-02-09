@@ -125,9 +125,11 @@ data_person <- data_person %>%
 data_person <- data_person %>%
   rowwise() %>%
   mutate(
-    lzo_values = list(c(lzo_item_01, lzo_item_02, lzo_item_03, lzo_item_04, lzo_item_05,
-                        lzo_item_06, lzo_item_07, lzo_item_08, lzo_item_09, lzo_item_10)),
-    longest_string = max(rle(lzo_values)$lengths),
+    longest_string = {
+      vals <- c(lzo_item_01, lzo_item_02, lzo_item_03, lzo_item_04, lzo_item_05,
+                lzo_item_06, lzo_item_07, lzo_item_08, lzo_item_09, lzo_item_10)
+      max(rle(vals)$lengths)
+    },
     careless = longest_string >= 9  # 90% identische Antworten
   ) %>%
   ungroup() %>%
@@ -538,13 +540,29 @@ if(nrow(csim_matrix) > 0) {
 ## Modell-Spezifikation
 
 ```{r lmm-model}
-# Maximale Struktur (gemäß Präregistrierung)
-model_full <- lmer(
-  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+# Prepare trial-level data for GLMM (binary DV: correct_source)
+# Filter to old items that were hits
+data_trial_hits <- data_cleaned %>%
+  filter(item_type == "old", is_hit == TRUE) %>%
+  left_join(data_person %>% select(vp_id, lzo_score, condition_ecology), by = "vp_id") %>%
+  mutate(
+    # Compute LZO centered at grand mean
+    lzo_centered = lzo_score - mean(data_person$lzo_score, na.rm = TRUE),
+    # Contrast coding
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5),
+    # Binary DV: correct source (0/1)
+    correct_source = as.numeric(is_correct_source)
+  )
+
+# Maximale Struktur (gemäß Präregistrierung): trial-level GLMM with binomial family
+model_full <- glmer(
+  correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
          (1 + valence_contrast | vp_id) +
          (1 | face_id),
-  data = data_analysis,
-  control = lmerControl(
+  data = data_trial_hits,
+  family = binomial(link = "logit"),
+  control = glmerControl(
     optimizer = "bobyqa",
     optCtrl = list(maxfun = 100000)
   )
@@ -555,29 +573,47 @@ if(isSingular(model_full)) {
   cat("WARNING: Singular fit detected. Trying reduced model...\n")
   
   # Reduzierte Struktur: Korrelation zwischen Random Effects entfernen
-  model_reduced <- lmer(
-    csim ~ ecology_contrast * valence_contrast * lzo_centered +
+  model_reduced <- glmer(
+    correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
            (1 + valence_contrast || vp_id) +  # || statt |
            (1 | face_id),
-    data = data_analysis,
-    control = lmerControl(
+    data = data_trial_hits,
+    family = binomial(link = "logit"),
+    control = glmerControl(
       optimizer = "bobyqa",
       optCtrl = list(maxfun = 100000)
     )
   )
   
   if(isSingular(model_reduced)) {
-    cat("Still singular. Using simplest structure...\n")
-    model_final <- lmer(
-      csim ~ ecology_contrast * valence_contrast * lzo_centered +
+    cat("Still singular. Trying without random slope...\n")
+    model_noslope <- glmer(
+      correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
              (1 | vp_id) +
              (1 | face_id),
-      data = data_analysis,
-      control = lmerControl(
+      data = data_trial_hits,
+      family = binomial(link = "logit"),
+      control = glmerControl(
         optimizer = "bobyqa",
         optCtrl = list(maxfun = 100000)
       )
     )
+    
+    if(isSingular(model_noslope)) {
+      cat("Still singular. Using simplest structure (vp_id only)...\n")
+      model_final <- glmer(
+        correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
+               (1 | vp_id),
+        data = data_trial_hits,
+        family = binomial(link = "logit"),
+        control = glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 100000)
+        )
+      )
+    } else {
+      model_final <- model_noslope
+    }
   } else {
     model_final <- model_reduced
   }
@@ -599,8 +635,8 @@ check_model(model_final)
 ## Fixed Effects
 
 ```{r lmm-fixed-effects}
-# ANOVA Tabelle (Type III)
-anova_table <- anova(model_final, type = "III")
+# ANOVA Tabelle (Type III) - use car::Anova for GLMM
+anova_table <- car::Anova(model_final, type = "III")
 print(anova_table)
 
 # Als schöne Tabelle
@@ -612,7 +648,7 @@ anova_df <- anova_df %>%
 
 kable(anova_df, caption = "ANOVA Type III Results") %>%
   kable_styling(bootstrap_options = c("striped", "hover")) %>%
-  row_spec(which(anova_df$`Pr(>F)` < 0.05), bold = TRUE, color = "red")
+  row_spec(which(anova_df$`Pr(>Chisq)` < 0.05), bold = TRUE, color = "red")
 ```
 
 ## Hypothesentests
@@ -620,9 +656,10 @@ kable(anova_df, caption = "ANOVA Type III Results") %>%
 ### H1 & H2: Ecology × Valence Interaktion
 
 ```{r hypothesis-h1-h2}
-# Estimated Marginal Means
+# Estimated Marginal Means (type = "response" for back-transformed probabilities)
 emm_ecology_valence <- emmeans(model_final, 
-                               ~ valence_encoded | condition_ecology)
+                               ~ valence_encoded | condition_ecology,
+                               type = "response")
 
 # Kontraste innerhalb jeder Ökologie
 contrasts_within_ecology <- contrast(emm_ecology_valence, 
@@ -635,7 +672,8 @@ print(contrasts_within_ecology)
 # H1: Realistic Ecology - untrustworthy > trustworthy
 h1_contrast <- contrast(
   emmeans(model_final, ~ valence_encoded | condition_ecology,
-          at = list(condition_ecology = "realistic")),
+          at = list(condition_ecology = "realistic"),
+          type = "response"),
   list(cheater_advantage = c(trustworthy = -1, untrustworthy = 1)),
   side = ">"
 )
@@ -646,7 +684,8 @@ print(h1_contrast)
 # H2: Inverted Ecology - trustworthy > untrustworthy (Umkehrung)
 h2_contrast <- contrast(
   emmeans(model_final, ~ valence_encoded | condition_ecology,
-          at = list(condition_ecology = "inverted")),
+          at = list(condition_ecology = "inverted"),
+          type = "response"),
   list(rarity_advantage = c(trustworthy = 1, untrustworthy = -1)),
   side = ">"
 )
@@ -658,12 +697,18 @@ print(h2_contrast)
 ### H3: Moderation durch LZO
 
 ```{r hypothesis-h3}
-# Dreifach-Interaktion aus ANOVA
-three_way_p <- anova_table["ecology_contrast:valence_contrast:lzo_centered", "Pr(>F)"]
+# Dreifach-Interaktion aus ANOVA (car::Anova returns Pr(>Chisq) for GLMMs)
+# Find the three-way interaction row by matching the name
+three_way_row <- grep("ecology_contrast:valence_contrast:lzo_centered", rownames(anova_table), value = TRUE)
+if (length(three_way_row) > 0) {
+  three_way_p <- anova_table[three_way_row, "Pr(>Chisq)"]
+} else {
+  three_way_p <- NA
+}
 
 cat("H3: Three-way Interaction p-value =", round(three_way_p, 4), "\n")
 
-if(three_way_p < 0.05) {
+if(!is.na(three_way_p) && three_way_p < 0.05) {
   # Simple Slopes für LZO
   emtrends_lzo <- emtrends(model_final, 
                            ~ ecology_contrast | valence_contrast, 
@@ -681,7 +726,8 @@ if(three_way_p < 0.05) {
     lzo_centered = lzo_values
   )
   
-  pred_data$csim_pred <- predict(model_final, newdata = pred_data, re.form = NA)
+  # Predict on response scale (probabilities)
+  pred_data$prob_pred <- predict(model_final, newdata = pred_data, type = "response", re.form = NA)
   
   pred_data <- pred_data %>%
     mutate(
@@ -693,7 +739,7 @@ if(three_way_p < 0.05) {
     )
   
   p_moderation <- ggplot(pred_data, 
-                        aes(x = valence_encoded, y = csim_pred, 
+                        aes(x = valence_encoded, y = prob_pred, 
                             color = condition_ecology, group = condition_ecology)) +
     geom_line(size = 1.2) +
     geom_point(size = 3) +
@@ -702,7 +748,7 @@ if(three_way_p < 0.05) {
     labs(
       title = "Three-Way Interaction: Ecology × Valence × LZO",
       x = "Valence",
-      y = "Predicted CSIM",
+      y = "Predicted P(Correct Source)",
       color = "Ecology"
     ) +
     theme_minimal() +
@@ -715,22 +761,30 @@ if(three_way_p < 0.05) {
 ## Effektstärken
 
 ```{r effect-sizes}
-# R² (Marginal & Conditional)
+# R² (Marginal & Conditional) - works for GLMMs too
 r2_values <- performance::r2(model_final)
 cat("Marginal R² (Fixed Effects only):", round(r2_values$R2_marginal, 3), "\n")
-cat("Conditional R² (Fixed + Random Effects):", round(r2_values$R2_conditional, 3), "\n")
+cat("Conditional R² (Fixed + Random Effects):", round(r2_values$R2_conditional, 3), "\n\n")
 
-# Partielles Eta² für Fixed Effects (approximativ)
-# Wird aus F-Werten berechnet
-anova_df <- as.data.frame(anova_table)
-anova_df$eta_sq_partial <- anova_df$`F value` * anova_df$NumDF / 
-  (anova_df$`F value` * anova_df$NumDF + anova_df$DenDF)
+# Odds Ratios for Fixed Effects (GLMM)
+cat("=== Odds Ratios ===\n")
+or_estimates <- exp(fixef(model_final))
+print(round(or_estimates, 3))
 
-anova_df_eta <- anova_df %>%
-  select(Effect = rownames(.), `F value`, `Pr(>F)`, eta_sq_partial) %>%
-  mutate(across(where(is.numeric), ~round(., 4)))
+cat("\n95% Confidence Intervals (Wald):\n")
+or_ci <- exp(confint(model_final, method = "Wald", parm = "beta_"))
+print(round(or_ci, 3))
 
-kable(anova_df_eta, caption = "Partial Eta² for Fixed Effects") %>%
+# Create a summary table
+or_table <- data.frame(
+  Effect = names(fixef(model_final)),
+  Odds_Ratio = or_estimates,
+  CI_Lower = or_ci[, 1],
+  CI_Upper = or_ci[, 2]
+) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+kable(or_table, caption = "Odds Ratios with 95% CI") %>%
   kable_styling(bootstrap_options = c("striped", "hover"))
 ```
 
@@ -776,33 +830,34 @@ ggplot(data_analysis, aes(x = valence_encoded, y = hit_rate, fill = valence_enco
 ## Sensitivitätsanalyse: Kovariaten
 
 ```{r sensitivity-covariates}
-# Modell mit Age und Gender als Kovariaten
-model_covariates <- lmer(
-  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+# Modell mit Age und Gender als Kovariaten (GLMM on trial-level data)
+model_covariates <- glmer(
+  correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
          age + gender +
          (1 | vp_id) +
          (1 | face_id),
-  data = data_analysis,
-  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+  data = data_trial_hits,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
 )
 
 # Vergleich der Haupteffekte
 cat("=== Comparison: With vs. Without Covariates ===\n")
 cat("\nOriginal Model:\n")
-print(anova(model_final, type = "III"))
+print(car::Anova(model_final, type = "III"))
 
 cat("\nWith Covariates:\n")
-print(anova(model_covariates, type = "III"))
+print(car::Anova(model_covariates, type = "III"))
 ```
 
 ## Alternative DV: d' (Signal Detection)
 
 ```{r robustness-dprime}
 # Gleiche Analyse mit d' statt CSIM
+# d' is aggregated per VP × Valence, so no face_id random effect
 model_dprime <- lmer(
   d_prime ~ ecology_contrast * valence_contrast * lzo_centered +
-            (1 | vp_id) +
-            (1 | face_id),
+            (1 | vp_id),
   data = data_analysis,
   control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
 )
@@ -821,17 +876,18 @@ cat("\nCorrelation CSIM - d':", round(cor_csim_dprime$estimate, 3),
 ## Geschlechtseffekte
 
 ```{r exploratory-gender}
-# Modell mit Gender-Interaktion (explorativ!)
-model_gender <- lmer(
-  csim ~ ecology_contrast * valence_contrast * gender +
+# Modell mit Gender-Interaktion (explorativ!) - use GLMM on trial-level data
+model_gender <- glmer(
+  correct_source ~ ecology_contrast * valence_contrast * gender +
          (1 | vp_id) +
          (1 | face_id),
-  data = data_analysis,
-  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+  data = data_trial_hits,
+  family = binomial(link = "logit"),
+  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
 )
 
 cat("=== EXPLORATORY: Gender Effects ===\n")
-print(anova(model_gender, type = "III"))
+print(car::Anova(model_gender, type = "III"))
 ```
 
 ## RT-Analysen
@@ -844,7 +900,10 @@ rt_analysis <- data_cleaned %>%
   summarise(
     mean_rt = mean(source_judgment_rt, na.rm = TRUE),
     .groups = "drop"
-  )
+  ) %>%
+  mutate(is_correct_source = factor(is_correct_source, 
+                                     levels = c(FALSE, TRUE),
+                                     labels = c("Incorrect", "Correct")))
 
 # RT-Unterschied: korrekt vs. inkorrekt
 rt_plot <- ggplot(rt_analysis, 

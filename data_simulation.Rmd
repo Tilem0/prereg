@@ -312,6 +312,7 @@ for (vp in 1:n_vp_total) {
   # LZO-Score berechnen
   lzo_items_vp <- person_info %>% 
     select(starts_with("lzo_item")) %>% 
+    unlist() %>%
     as.numeric()
   lzo_score <- mean(lzo_items_vp, na.rm = TRUE)
   
@@ -436,9 +437,18 @@ for (vp in 1:n_vp_total) {
                                 mean = rt_recognition_mean * 0.95,  # Etwas schneller bei "new"
                                 sd = rt_recognition_sd)
     
-    # Neue Items haben keine Source (auch wenn fälschlich als "old" erkannt)
-    source_judgment <- NA
-    source_judgment_rt <- NA
+    # Source Judgment für False Alarms (für MPT-Modellierung)
+    if (is_false_alarm == 1) {
+      # Guessing - zufällige Source-Zuordnung
+      source_judgment <- sample(c("trustworthy", "untrustworthy", "dont_know"),
+                               1, prob = c(0.40, 0.40, 0.20))
+      source_judgment_rt <- round(rtruncnorm(1, a = 400, b = 6000,
+                                             mean = rt_source_mean * 1.1,
+                                             sd = rt_source_sd))
+    } else {
+      source_judgment <- NA
+      source_judgment_rt <- NA
+    }
     
     trial <- data.frame(
       vp_id = vp_id,
@@ -685,9 +695,11 @@ test_csim <- test_csim %>%
 library(lme4)
 library(lmerTest)
 
+# Note: Aggregated data doesn't have face_id, so we use only vp_id random effect
+# The full trial-level GLMM with face_id is in analysis_pipeline.Rmd
 model_test <- lmer(
   csim ~ ecology_contrast * valence_contrast * lzo_centered +
-         (1 | vp_id) + (1 | face_id),
+         (1 | vp_id),
   data = test_csim
 )
 
