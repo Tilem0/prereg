@@ -587,7 +587,7 @@ if(isSingular(model_full)) {
   
   if(isSingular(model_reduced)) {
     cat("Still singular. Trying without random slope...\n")
-    model_nosope <- glmer(
+    model_noslope <- glmer(
       correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
              (1 | vp_id) +
              (1 | face_id),
@@ -599,7 +599,7 @@ if(isSingular(model_full)) {
       )
     )
     
-    if(isSingular(model_nosope)) {
+    if(isSingular(model_noslope)) {
       cat("Still singular. Using simplest structure (vp_id only)...\n")
       model_final <- glmer(
         correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
@@ -612,7 +612,7 @@ if(isSingular(model_full)) {
         )
       )
     } else {
-      model_final <- model_nosope
+      model_final <- model_noslope
     }
   } else {
     model_final <- model_reduced
