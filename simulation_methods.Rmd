@@ -1,0 +1,742 @@
+---
+title: "Datensimulation für Source Memory Studie"
+subtitle: "Methoden & Implementierung"
+author: "Simulationsguide"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Übersicht der Simulationsmethoden
+
+Für das vorliegende 2×2-Mixed-Design mit hierarchischer Datenstruktur gibt es verschiedene Simulationsansätze:
+
+1. **Einfache parametrische Simulation**: Direkte Simulation von CSIM-Werten mit Normalverteilung
+2. **Beta-Verteilung**: Für bounded outcomes (CSIM zwischen 0 und 1)
+3. **Trial-basierte GLMM-Simulation**: Simulation auf Einzeltrial-Ebene mit binären Outcomes
+4. **MPT-basierte Simulation**: Kognitive Prozessmodellierung
+5. **Package-basierte Simulation**: Mit `faux`, `simr` oder `powerlmm`
+
+---
+
+# Methode 1: Einfache parametrische Simulation
+
+**Vorteile**: Schnell, einfach zu verstehen, gut für Poweranalysen  
+**Nachteile**: Ignoriert bounded nature von CSIM, keine Trial-Ebene
+
+```{r method1-simple}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+
+set.seed(42)
+
+# Parameter definieren
+n_vp_per_condition <- 50  # 50 VPs pro Ökologie-Bedingung
+n_total <- n_vp_per_condition * 2
+
+# Effekt-Parameter (basierend auf Literatur oder Pilotdaten)
+baseline_csim <- 0.60        # Baseline Source Memory
+ecology_effect <- 0.10       # Haupteffekt Ökologie
+valence_effect_realistic <- 0.15  # Cheater advantage in realistic ecology
+valence_effect_inverted <- -0.10  # Umkehrung in inverted ecology
+lzo_effect <- 0.05           # LZO Haupteffekt
+three_way_interaction <- 0.08     # Dreifach-Interaktion
+
+# Random Effects
+sd_vp <- 0.15               # Between-subjects SD
+sd_item <- 0.05             # Between-items SD
+sd_residual <- 0.10         # Residual SD
+
+# Datensatz erstellen
+data_sim <- expand.grid(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_total)),
+  valence_encoded = c("trustworthy", "untrustworthy")
+) %>%
+  mutate(
+    condition_ecology = rep(c("realistic", "inverted"), 
+                           each = n_vp_per_condition, 
+                           times = 2),
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+# LZO generieren (normalverteilt, dann auf 1-7 skaliert)
+lzo_raw <- rnorm(n_total, mean = 4, sd = 1)
+lzo_scores <- data.frame(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_total)),
+  lzo_score = pmin(7, pmax(1, lzo_raw))  # Truncate to 1-7
+)
+
+data_sim <- data_sim %>%
+  left_join(lzo_scores, by = "vp_id") %>%
+  mutate(
+    lzo_centered = lzo_score - mean(lzo_score)
+  )
+
+# Random Effects generieren
+vp_random <- data.frame(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_total)),
+  vp_intercept = rnorm(n_total, mean = 0, sd = sd_vp)
+)
+
+# Für Einfachheit: 12 Items pro Valenzbedingung
+face_ids <- paste0("F", sprintf("%03d", 1:24))
+item_random <- data.frame(
+  face_id = face_ids,
+  item_intercept = rnorm(24, mean = 0, sd = sd_item)
+)
+
+# CSIM simulieren
+data_sim <- data_sim %>%
+  left_join(vp_random, by = "vp_id") %>%
+  # Jeder VP bekommt ein zufälliges Item
+  mutate(
+    face_id = sample(face_ids, n(), replace = TRUE)
+  ) %>%
+  left_join(item_random, by = "face_id") %>%
+  mutate(
+    # Fixed Effects
+    mu = baseline_csim +
+         ecology_contrast * ecology_effect +
+         valence_contrast * ifelse(condition_ecology == "realistic", 
+                                   valence_effect_realistic, 
+                                   valence_effect_inverted) +
+         lzo_centered * lzo_effect +
+         ecology_contrast * valence_contrast * lzo_centered * three_way_interaction,
+    
+    # Random Effects
+    csim_true = mu + vp_intercept + item_intercept,
+    
+    # Residual
+    csim = csim_true + rnorm(n(), mean = 0, sd = sd_residual),
+    
+    # Bound to [0, 1]
+    csim = pmin(1, pmax(0, csim))
+  )
+
+# Simulation testen
+model_sim <- lmer(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         (1 | vp_id) + (1 | face_id),
+  data = data_sim
+)
+
+summary(model_sim)
+
+# Visualisierung
+ggplot(data_sim, aes(x = valence_encoded, y = csim, fill = condition_ecology)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9)) +
+  facet_wrap(~ condition_ecology) +
+  labs(title = "Simulated Data: Method 1 (Simple Parametric)",
+       y = "Simulated CSIM") +
+  theme_minimal()
+```
+
+---
+
+# Methode 2: Beta-Verteilung
+
+**Vorteile**: Respektiert bounds [0,1], flexibel in Form  
+**Nachteile**: Parametrisierung weniger intuitiv, benötigt `glmmTMB` für LMM
+
+```{r method2-beta}
+library(glmmTMB)
+
+set.seed(42)
+
+# Beta-Verteilung parametrisieren über mu (mean) und phi (precision)
+# mu = mean, phi = "sample size parameter" (höher = weniger Varianz)
+
+# Funktion zum Simulieren von Beta-verteilten CSIM-Werten
+simulate_csim_beta <- function(mu, phi) {
+  # mu: erwarteter Mittelwert (0 < mu < 1)
+  # phi: Precision-Parameter (größer = weniger Streuung)
+  
+  alpha <- mu * phi
+  beta <- (1 - mu) * phi
+  
+  rbeta(1, shape1 = alpha, shape2 = beta)
+}
+
+# Parameter
+n_vp_per_condition <- 50
+n_total <- n_vp_per_condition * 2
+
+baseline_mu <- 0.60
+ecology_effect <- 0.10
+valence_effect_realistic <- 0.15
+valence_effect_inverted <- -0.10
+phi_base <- 20  # Precision (höher = weniger Streuung)
+
+# Datensatz
+data_beta <- expand.grid(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_total)),
+  valence_encoded = c("trustworthy", "untrustworthy")
+) %>%
+  mutate(
+    condition_ecology = rep(c("realistic", "inverted"), 
+                           each = n_vp_per_condition, times = 2),
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+# LZO
+lzo_scores_beta <- data.frame(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_total)),
+  lzo_score = pmin(7, pmax(1, rnorm(n_total, mean = 4, sd = 1))),
+  lzo_centered = 0
+)
+lzo_scores_beta$lzo_centered <- lzo_scores_beta$lzo_score - mean(lzo_scores_beta$lzo_score)
+
+data_beta <- data_beta %>%
+  left_join(lzo_scores_beta, by = "vp_id") %>%
+  rowwise() %>%
+  mutate(
+    # mu für Beta-Verteilung
+    mu_beta = baseline_mu +
+              ecology_contrast * ecology_effect +
+              valence_contrast * ifelse(condition_ecology == "realistic", 
+                                       valence_effect_realistic, 
+                                       valence_effect_inverted) +
+              lzo_centered * 0.05,
+    
+    # Bounds beachten
+    mu_beta = pmin(0.99, pmax(0.01, mu_beta)),
+    
+    # CSIM aus Beta-Verteilung
+    csim = simulate_csim_beta(mu_beta, phi_base)
+  ) %>%
+  ungroup()
+
+# Analyse mit Beta-Regression (glmmTMB)
+# Hinweis: Beta-Regression benötigt (0,1) exklusive, also kleine Anpassung
+data_beta <- data_beta %>%
+  mutate(csim_transformed = (csim * (n() - 1) + 0.5) / n())
+
+model_beta <- glmmTMB(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         (1 | vp_id),
+  data = data_beta,
+  family = beta_family()
+)
+
+summary(model_beta)
+
+# Visualisierung
+ggplot(data_beta, aes(x = csim)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "red", size = 1.2) +
+  facet_wrap(~ condition_ecology + valence_encoded, ncol = 2) +
+  labs(title = "Simulated Data: Method 2 (Beta Distribution)",
+       x = "Simulated CSIM",
+       y = "Density") +
+  theme_minimal()
+```
+
+---
+
+# Methode 3: Trial-basierte GLMM-Simulation
+
+**Vorteile**: Realistische Trial-Ebene, erlaubt Item-Memory-Kontrolle  
+**Nachteile**: Rechenintensiv, komplex
+
+```{r method3-trial-level}
+set.seed(42)
+
+# Studiendesign
+n_vp_per_condition <- 50
+n_vp_total <- n_vp_per_condition * 2
+n_items_per_valence <- 12  # 12 trustworthy, 12 untrustworthy
+n_items_total <- 24
+n_new_items <- 24
+
+# Parameter für Binomial-Prozesse
+p_hit_baseline <- 0.75      # Baseline Hit Rate
+p_source_given_hit <- 0.60  # Baseline P(correct source | hit)
+
+# Effekte auf Source Memory (logit scale)
+ecology_effect_logit <- 0.4
+valence_effect_realistic_logit <- 0.6
+valence_effect_inverted_logit <- -0.5
+
+# Trial-Level Datensatz erstellen
+data_trial <- expand.grid(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_vp_total)),
+  face_id = paste0("F", sprintf("%03d", 1:n_items_total)),
+  item_type = "old"
+) %>%
+  mutate(
+    # Ökologie-Bedingung
+    condition_ecology = rep(c("realistic", "inverted"), 
+                           each = n_vp_per_condition, 
+                           length.out = n()),
+    
+    # Valenz basierend auf Face ID (erste 12 = trustworthy, zweite 12 = untrustworthy)
+    face_num = as.numeric(gsub("F", "", face_id)),
+    valence_encoded = ifelse(face_num <= 12, "trustworthy", "untrustworthy"),
+    
+    # Kontrastkodierung
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+# LZO pro VP
+lzo_vp <- data.frame(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_vp_total)),
+  lzo_score = pmin(7, pmax(1, rnorm(n_vp_total, mean = 4, sd = 1)))
+)
+lzo_vp$lzo_centered <- lzo_vp$lzo_score - mean(lzo_vp$lzo_score)
+
+data_trial <- data_trial %>%
+  left_join(lzo_vp, by = "vp_id")
+
+# Random Effects
+vp_re <- data.frame(
+  vp_id = unique(data_trial$vp_id),
+  vp_re_hit = rnorm(n_vp_total, 0, 0.3),
+  vp_re_source = rnorm(n_vp_total, 0, 0.4)
+)
+
+item_re <- data.frame(
+  face_id = paste0("F", sprintf("%03d", 1:n_items_total)),
+  item_re_hit = rnorm(n_items_total, 0, 0.2),
+  item_re_source = rnorm(n_items_total, 0, 0.2)
+)
+
+data_trial <- data_trial %>%
+  left_join(vp_re, by = "vp_id") %>%
+  left_join(item_re, by = "face_id")
+
+# Simuliere binäre Outcomes
+data_trial <- data_trial %>%
+  rowwise() %>%
+  mutate(
+    # 1. Item Recognition (Hit)
+    logit_hit = qlogis(p_hit_baseline) + vp_re_hit + item_re_hit,
+    p_hit = plogis(logit_hit),
+    is_hit = rbinom(1, 1, p_hit),
+    
+    # 2. Source Memory (nur wenn Hit)
+    valence_effect_cond = ifelse(condition_ecology == "realistic",
+                                 valence_effect_realistic_logit,
+                                 valence_effect_inverted_logit),
+    
+    logit_source = qlogis(p_source_given_hit) + 
+                   vp_re_source + 
+                   item_re_source +
+                   ecology_contrast * ecology_effect_logit +
+                   valence_contrast * valence_effect_cond +
+                   lzo_centered * 0.15,
+    
+    p_source_correct = plogis(logit_source),
+    
+    # Correct Source nur wenn Hit
+    is_correct_source = ifelse(is_hit == 1,
+                               rbinom(1, 1, p_source_correct),
+                               0)
+  ) %>%
+  ungroup()
+
+# CSIM berechnen
+data_csim_trial <- data_trial %>%
+  group_by(vp_id, condition_ecology, valence_encoded, ecology_contrast, 
+           valence_contrast, lzo_centered) %>%
+  summarise(
+    n_hits = sum(is_hit),
+    n_correct_source = sum(is_correct_source),
+    csim = ifelse(n_hits > 0, n_correct_source / n_hits, NA),
+    hit_rate = mean(is_hit),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(csim))
+
+# Analyse
+model_trial <- lmer(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         (1 | vp_id),
+  data = data_csim_trial
+)
+
+summary(model_trial)
+
+# Visualisierung: Hit Rate Check
+ggplot(data_csim_trial, aes(x = valence_encoded, y = hit_rate)) +
+  geom_violin(fill = "lightblue", alpha = 0.5) +
+  geom_boxplot(width = 0.2) +
+  facet_wrap(~ condition_ecology) +
+  labs(title = "Method 3: Item Memory Control",
+       subtitle = "Hit Rates should be equivalent across valence",
+       y = "Hit Rate") +
+  theme_minimal()
+
+# CSIM Visualisierung
+ggplot(data_csim_trial, aes(x = valence_encoded, y = csim, fill = condition_ecology)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9)) +
+  labs(title = "Method 3: Trial-based GLMM Simulation",
+       y = "CSIM") +
+  theme_minimal()
+```
+
+---
+
+# Methode 4: MPT-basierte Simulation
+
+**Vorteile**: Theoretisch fundiert, modelliert kognitive Prozesse  
+**Nachteile**: Komplex, benötigt MPT-Expertise
+
+```{r method4-mpt}
+# MPT-Modell für Source Memory:
+# d = Source Memory Parameter (Was wir messen wollen)
+# b = Bias Parameter (Tendenz zu einer Antwort)
+# g = Guessing Parameter (Rate bei Unsicherheit)
+
+library(MPTinR)
+
+set.seed(42)
+
+# Funktion zur Simulation basierend auf MPT-Parametern
+simulate_mpt_data <- function(n_trials, d, b, g) {
+  # Outcomes:
+  # 1 = Correct Source
+  # 2 = Incorrect Source
+  # 3 = "Don't know"
+  
+  outcomes <- numeric(n_trials)
+  
+  for (i in 1:n_trials) {
+    # Source remembered (Probability d)
+    if (runif(1) < d) {
+      outcomes[i] <- 1  # Correct source
+    } else {
+      # Source not remembered, guessing
+      if (runif(1) < g) {
+        outcomes[i] <- 1  # Guess correct
+      } else {
+        # Bias to respond vs. "don't know"
+        if (runif(1) < b) {
+          outcomes[i] <- 2  # Guess incorrect
+        } else {
+          outcomes[i] <- 3  # "Don't know"
+        }
+      }
+    }
+  }
+  
+  # Kategorien zählen
+  c(
+    correct = sum(outcomes == 1),
+    incorrect = sum(outcomes == 2),
+    dont_know = sum(outcomes == 3)
+  )
+}
+
+# Simulation für verschiedene Bedingungen
+n_vp <- 50
+n_trials_per_condition <- 12
+
+# Parameter variieren nach Bedingung
+params_realistic_trust <- list(d = 0.55, b = 0.60, g = 0.50)
+params_realistic_untrust <- list(d = 0.70, b = 0.60, g = 0.50)  # Cheater advantage
+params_inverted_trust <- list(d = 0.70, b = 0.60, g = 0.50)     # Rarity advantage
+params_inverted_untrust <- list(d = 0.55, b = 0.60, g = 0.50)
+
+# Datensatz
+data_mpt <- data.frame()
+
+for (vp in 1:n_vp) {
+  for (ecology in c("realistic", "inverted")) {
+    for (valence in c("trustworthy", "untrustworthy")) {
+      
+      # Parameter auswählen
+      if (ecology == "realistic" & valence == "trustworthy") {
+        params <- params_realistic_trust
+      } else if (ecology == "realistic" & valence == "untrustworthy") {
+        params <- params_realistic_untrust
+      } else if (ecology == "inverted" & valence == "trustworthy") {
+        params <- params_inverted_trust
+      } else {
+        params <- params_inverted_untrust
+      }
+      
+      # Individuelle Variation hinzufügen
+      d_ind <- pmin(0.99, pmax(0.01, params$d + rnorm(1, 0, 0.10)))
+      
+      # Daten simulieren
+      outcomes <- simulate_mpt_data(n_trials_per_condition, 
+                                   d = d_ind, 
+                                   b = params$b, 
+                                   g = params$g)
+      
+      # CSIM berechnen (unter Annahme dass alle Items erkannt wurden)
+      csim <- outcomes["correct"] / n_trials_per_condition
+      
+      data_mpt <- rbind(data_mpt, data.frame(
+        vp_id = paste0("VP", sprintf("%03d", vp)),
+        condition_ecology = ecology,
+        valence_encoded = valence,
+        d_true = d_ind,
+        correct = outcomes["correct"],
+        incorrect = outcomes["incorrect"],
+        dont_know = outcomes["dont_know"],
+        csim = csim
+      ))
+    }
+  }
+}
+
+# Analyse
+data_mpt <- data_mpt %>%
+  mutate(
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+model_mpt <- lmer(
+  csim ~ ecology_contrast * valence_contrast + (1 | vp_id),
+  data = data_mpt
+)
+
+summary(model_mpt)
+
+# Visualisierung: d-Parameter
+ggplot(data_mpt, aes(x = valence_encoded, y = d_true, fill = condition_ecology)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9)) +
+  labs(title = "Method 4: MPT-based Simulation",
+       subtitle = "True d-parameters across conditions",
+       y = "Source Memory Parameter (d)") +
+  theme_minimal()
+```
+
+---
+
+# Methode 5: Package-basierte Simulation (faux)
+
+**Vorteile**: Elegant, validiert, gute Korrelationsstruktur  
+**Nachteile**: Weniger Kontrolle über exakte Mechanismen
+
+```{r method5-faux}
+library(faux)
+
+set.seed(42)
+
+# Design spezifizieren
+n_vp <- 50
+between <- list(condition_ecology = c("realistic", "inverted"))
+within <- list(valence_encoded = c("trustworthy", "untrustworthy"))
+
+# Mittelwerte für jede Zelle (2x2)
+mu <- data.frame(
+  realistic_trustworthy = 0.55,
+  realistic_untrustworthy = 0.70,   # Cheater advantage
+  inverted_trustworthy = 0.70,      # Rarity advantage
+  inverted_untrustworthy = 0.55
+)
+
+# SD pro Zelle
+sd <- 0.15
+
+# Within-subject Korrelation
+r <- 0.5  # Korrelation zwischen trustworthy und untrustworthy innerhalb VP
+
+# Daten simulieren
+data_faux <- sim_design(
+  within = within,
+  between = between,
+  n = n_vp,
+  mu = mu,
+  sd = sd,
+  r = r,
+  empirical = FALSE,  # TRUE = exakte Parameter, FALSE = Sampling-Variabilität
+  id = "vp_id",
+  dv = "csim"
+)
+
+# In Long Format
+data_faux_long <- data_faux %>%
+  pivot_longer(
+    cols = c(realistic_trustworthy, realistic_untrustworthy,
+             inverted_trustworthy, inverted_untrustworthy),
+    names_to = "condition",
+    values_to = "csim"
+  ) %>%
+  separate(condition, into = c("condition_ecology", "valence_encoded"), sep = "_") %>%
+  mutate(
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5),
+    csim = pmin(1, pmax(0, csim))  # Bound to [0,1]
+  )
+
+# Analyse
+model_faux <- lmer(
+  csim ~ ecology_contrast * valence_contrast + (1 | vp_id),
+  data = data_faux_long
+)
+
+summary(model_faux)
+
+# Visualisierung
+ggplot(data_faux_long, aes(x = valence_encoded, y = csim, fill = condition_ecology)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9)) +
+  labs(title = "Method 5: faux Package Simulation",
+       subtitle = "Elegant specification with correlation structure",
+       y = "CSIM") +
+  theme_minimal()
+```
+
+---
+
+# Poweranalyse mit Simulation
+
+```{r power-analysis}
+library(simr)
+
+# Basierend auf Methode 3 (Trial-Level)
+# Fixiere Modell mit erwarteten Effekten
+
+# Beispiel-Modell (aus vorheriger Simulation)
+base_model <- model_trial  # Aus Methode 3
+
+# Power für festen Effekt testen
+# H1/H2: Ecology × Valence Interaktion
+power_interaction <- powerSim(
+  base_model,
+  test = fixed("ecology_contrast:valence_contrast", "lr"),
+  nsim = 100,  # In Praxis: 1000+
+  progress = TRUE
+)
+
+print(power_interaction)
+
+# Power-Kurve über verschiedene Sample Sizes
+# (Warnung: rechenintensiv!)
+# pc <- powerCurve(base_model, 
+#                  test = fixed("ecology_contrast:valence_contrast"),
+#                  along = "vp_id",
+#                  breaks = seq(20, 100, by = 10),
+#                  nsim = 50)
+# plot(pc)
+```
+
+---
+
+# Empfehlungen für Ihre Studie
+
+## Welche Methode wählen?
+
+**Für Präregistrierung & A-priori Power:**
+- **Methode 1** (Einfache parametrische Simulation) ist am besten geeignet
+- Schnell, transparent, ausreichend für Poweranalyse
+- Code kann direkt in Präregistrierung aufgenommen werden
+
+**Für Pilotierung:**
+- **Methode 3** (Trial-basiert) empfohlen
+- Erlaubt Kontrolle von Item Memory
+- Kann realistische Datenstruktur generieren
+
+**Für theoretische Modellierung:**
+- **Methode 4** (MPT) wenn kognitive Prozesse im Fokus stehen
+- Verbindet Theorie und Daten direkt
+
+## Implementierungs-Workflow
+
+```{r workflow-example}
+# 1. Parameter aus Pilotdaten oder Literatur
+pilot_params <- list(
+  baseline_csim = 0.60,
+  ecology_effect = 0.10,
+  cheater_advantage = 0.15,
+  rarity_reversal = -0.10,
+  lzo_moderation = 0.08,
+  sd_vp = 0.15,
+  sd_residual = 0.10
+)
+
+# 2. Simulation mit verschiedenen N
+test_sample_sizes <- function(n_range, nsim = 100) {
+  results <- data.frame()
+  
+  for (n in n_range) {
+    power_count <- 0
+    
+    for (sim in 1:nsim) {
+      # Daten simulieren (vereinfachte Version)
+      data_temp <- expand.grid(
+        vp_id = 1:n,
+        valence = c(-0.5, 0.5)
+      ) %>%
+        mutate(
+          ecology = rep(c(-0.5, 0.5), each = n/2, length.out = n()),
+          csim = 0.60 + 
+                 ecology * 0.10 + 
+                 valence * ifelse(ecology == -0.5, 0.15, -0.10) +
+                 rnorm(n(), 0, 0.15)
+        )
+      
+      # Modell fitten
+      model_temp <- lmer(csim ~ ecology * valence + (1 | vp_id), 
+                        data = data_temp)
+      
+      # P-Wert für Interaktion
+      p_value <- anova(model_temp)["ecology:valence", "Pr(>F)"]
+      
+      if (p_value < 0.05) power_count <- power_count + 1
+    }
+    
+    results <- rbind(results, data.frame(
+      n = n,
+      power = power_count / nsim
+    ))
+  }
+  
+  return(results)
+}
+
+# Beispiel (kleine nsim für Demo)
+# power_curve <- test_sample_sizes(seq(40, 100, by = 20), nsim = 50)
+# 
+# ggplot(power_curve, aes(x = n, y = power)) +
+#   geom_line(size = 1.2) +
+#   geom_point(size = 3) +
+#   geom_hline(yintercept = 0.80, linetype = "dashed", color = "red") +
+#   labs(title = "Power Analysis via Simulation",
+#        x = "Sample Size per Condition",
+#        y = "Statistical Power") +
+#   theme_minimal()
+```
+
+---
+
+# Zusammenfassung
+
+| Methode | Komplexität | Realismus | Poweranalyse | Empfehlung für |
+|---------|-------------|-----------|--------------|----------------|
+| 1. Parametrisch | Niedrig | Mittel | Excellent | Präregistrierung |
+| 2. Beta | Mittel | Hoch | Gut | Bounded DVs |
+| 3. Trial-GLMM | Hoch | Sehr hoch | Gut | Pilotierung |
+| 4. MPT | Sehr hoch | Theoretisch | Mittel | Prozessmodelle |
+| 5. faux | Niedrig | Mittel | Gut | Schnelle Tests |
+
+**Workflow-Empfehlung:**
+1. **Präregistrierung**: Methode 1 mit dokumentierten Annahmen
+2. **Pilotierung**: Methode 3 um realistische Parameter zu schätzen
+3. **Hauptstudie**: Parameter aus Pilot → Update Poweranalyse
+4. **Robustheit**: Sensitivitätsanalyse mit verschiedenen Parametersets
+
+```{r session-info}
+sessionInfo()
+```

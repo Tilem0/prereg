@@ -1,0 +1,726 @@
+---
+title: "Datensimulation: Source Memory Studie"
+subtitle: "Generierung von data_trial_level.csv & data_person_level.csv"
+author: "Simulationsskript gemäß Präregistrierung"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+# Übersicht
+
+Dieses Skript simuliert Daten für die Source Memory Studie gemäß der Präregistrierung:
+
+**Design:**
+- 2×2 Mixed Design
+- Between: Informationsökologie (realistic vs. inverted)
+- Within: Valenz (trustworthy vs. untrustworthy)
+- N = 100 VPs (50 pro Bedingung)
+
+**Materialien:**
+- 48 Gesichter total (MEBeauty) - gemäß Präregistrierung
+  - 24 alte Items (Encoding-Phase)
+  - 24 neue Items (Distraktoren im Recognition Test)
+- 24 Vignetten (Text-Beschreibungen)
+  - 12 trustworthy Vignetten
+  - 12 untrustworthy Vignetten
+  
+**WICHTIG - Ökologie-Implementierung:**
+- Jede VP sieht alle 24 Gesichter in Encoding
+- Die **Vignetten werden randomisiert den Gesichtern zugeordnet**
+- In realistic ecology: 17 Gesichter mit trustworthy Vignetten, 7 mit untrustworthy
+- In inverted ecology: 7 Gesichter mit trustworthy Vignetten, 17 mit untrustworthy
+- **Vignetten werden mit Wiederholung verwendet** (sample with replacement)
+  - Realistic: 17 Gesichter brauchen trustworthy Vignetten, aber es gibt nur 12 → manche werden 2x verwendet
+  - Das ist korrekt und entspricht der Präregistrierung!
+
+**Verteilung in Encoding:**
+- Realistic Ecology: 70% trustworthy (≈17 Items), 30% untrustworthy (≈7 Items)
+- Inverted Ecology: 30% trustworthy (≈7 Items), 70% untrustworthy (≈17 Items)
+
+# Pakete laden
+
+```{r packages}
+library(tidyverse)
+library(truncnorm)  # Für truncated normal distributions
+
+set.seed(2024)  # Reproduzierbarkeit
+```
+
+# Parameter definieren
+
+## Studiendesign-Parameter
+
+```{r design-params}
+# Stichprobe
+n_vp_per_condition <- 50  # 50 pro Ökologie-Bedingung
+n_vp_total <- n_vp_per_condition * 2
+
+# Items
+# Gemäß Präregistrierung: 48 Gesichter total, 24 alte + 24 neue
+n_faces_total <- 48
+n_old_items <- 24  # Gesichter in Encoding-Phase (jede VP sieht diese 24)
+n_new_items <- 24  # Distraktoren
+
+# Vignetten (Text-Inhalte, die die Valenz bestimmen)
+n_trustworthy_vignettes <- 12  # 12 verschiedene trustworthy Texte
+n_untrustworthy_vignettes <- 12  # 12 verschiedene untrustworthy Texte
+
+# WICHTIG: Gesichter werden fix zugeordnet, aber Vignetten können
+# mehrfach verwendet werden (mit verschiedenen Gesichtern gepaart)
+
+# Ökologie-Verteilungen (wie viele Items jeder Valenz sieht eine VP)
+# Realistic: 70% trustworthy, 30% untrustworthy
+n_trust_realistic <- 17   # ≈70% von 24
+n_untrust_realistic <- 7  # ≈30% von 24
+
+# Inverted: 30% trustworthy, 70% untrustworthy  
+n_trust_inverted <- 7     # ≈30% von 24
+n_untrust_inverted <- 17  # ≈70% von 24
+```
+
+## Psychologische Effekt-Parameter
+
+```{r effect-params}
+# --- RECOGNITION (Item Memory) ---
+# Baseline Hit Rate (sollte äquivalent über Valenzbedingungen sein)
+p_hit_baseline <- 0.75
+
+# False Alarm Rate
+p_fa_baseline <- 0.15
+
+# Random Effects auf Hit Rate
+sd_vp_hit <- 0.20      # Between-subjects variability
+sd_item_hit <- 0.10    # Between-items variability
+
+# --- SOURCE MEMORY ---
+# Baseline: P(correct source | hit)
+p_source_baseline <- 0.60
+
+# Effekte (auf logit scale für realistische Grenzen)
+ecology_effect_logit <- 0.3        # Kleiner Haupteffekt Ökologie
+cheater_advantage_logit <- 0.65    # H1: Cheater advantage in realistic
+rarity_reversal_logit <- -0.55     # H2: Umkehrung in inverted (negative!)
+lzo_main_effect_logit <- 0.20      # LZO Haupteffekt
+lzo_interaction_logit <- 0.40      # H3: LZO verstärkt Seltenheitseffekt
+
+# Random Effects auf Source Memory
+sd_vp_source <- 0.35
+sd_item_source <- 0.15
+
+# --- REACTION TIMES ---
+# Recognition RT
+rt_recognition_mean <- 1200  # ms
+rt_recognition_sd <- 300
+
+# Source Judgment RT  
+rt_source_mean <- 1800
+rt_source_sd <- 450
+```
+
+# Person-Level Daten generieren
+
+```{r person-level}
+# Basis-Datensatz
+data_person <- data.frame(
+  vp_id = paste0("VP", sprintf("%03d", 1:n_vp_total))
+) %>%
+  mutate(
+    # Bedingungszuweisung (randomisiert)
+    condition_ecology = rep(c("realistic", "inverted"), each = n_vp_per_condition),
+    
+    # Demografische Daten
+    age = round(runif(n_vp_total, min = 18, max = 35)),
+    
+    gender = sample(c("male", "female", "diverse"), 
+                   n_vp_total, 
+                   replace = TRUE,
+                   prob = c(0.45, 0.50, 0.05)),
+    
+    relationship_status = "single"  # Einschlusskriterium
+  )
+
+# LZO-Items generieren (10 Items, 7-stufige Likert-Skala)
+# Mit realistischer Korrelationsstruktur
+lzo_correlation <- 0.6  # Moderate Korrelation zwischen Items
+
+# Latenter LZO-Score pro Person
+latent_lzo <- rnorm(n_vp_total, mean = 4, sd = 1.2)
+
+# Items mit Noise
+lzo_items <- matrix(NA, nrow = n_vp_total, ncol = 10)
+
+for (i in 1:10) {
+  # Item = latenter Score + item-spezifischer Noise
+  item_response <- latent_lzo + rnorm(n_vp_total, mean = 0, sd = 0.8)
+  
+  # Auf 1-7 Skala begrenzen und runden
+  lzo_items[, i] <- round(pmin(7, pmax(1, item_response)))
+}
+
+colnames(lzo_items) <- paste0("lzo_item_", sprintf("%02d", 1:10))
+
+# LZO-Items zum Datensatz hinzufügen
+data_person <- cbind(data_person, as.data.frame(lzo_items))
+
+# Random Effects für diese VPs generieren (werden später genutzt)
+data_person <- data_person %>%
+  mutate(
+    vp_re_hit = rnorm(n_vp_total, mean = 0, sd = sd_vp_hit),
+    vp_re_source = rnorm(n_vp_total, mean = 0, sd = sd_vp_source)
+  )
+
+# Datenstruktur prüfen
+glimpse(data_person)
+```
+
+# Item-Level: Gesichter & Vignetten
+
+```{r items}
+# Gesichter-IDs (fix, wie in Präregistrierung)
+faces_old <- paste0("F", sprintf("%03d", 1:n_old_items))
+faces_new <- paste0("F", sprintf("%03d", (n_old_items + 1):n_faces_total))
+
+# Vignetten-IDs (die Text-Inhalte)
+vignettes_trust <- paste0("VIG_T", sprintf("%02d", 1:n_trustworthy_vignettes))
+vignettes_untrust <- paste0("VIG_U", sprintf("%02d", 1:n_untrustworthy_vignettes))
+
+# Random Effects für Gesichter (diese bleiben über alle VPs konstant)
+all_faces <- c(faces_old, faces_new)
+item_random_effects <- data.frame(
+  face_id = all_faces,
+  item_re_hit = rnorm(n_faces_total, mean = 0, sd = sd_item_hit),
+  item_re_source = rnorm(n_faces_total, mean = 0, sd = sd_item_source)
+)
+
+cat("Generierte Stimuli:\n")
+cat("  - Alte Gesichter:", n_old_items, "\n")
+cat("  - Neue Gesichter:", n_new_items, "\n")
+cat("  - Trustworthy Vignetten:", n_trustworthy_vignettes, "\n")
+cat("  - Untrustworthy Vignetten:", n_untrustworthy_vignettes, "\n")
+cat("  - Total Gesichter:", n_faces_total, "\n")
+```
+
+# Trial-Level Daten: Encoding-Phase
+
+Die Encoding-Phase ist nicht direkt getestet, aber bestimmt, welche Items
+jede VP sieht und in welcher Ökologie-Verteilung.
+
+```{r encoding}
+# Für jede VP: Zuordnung von Vignetten zu Gesichtern
+encoding_trials <- data.frame()
+
+for (vp in 1:n_vp_total) {
+  vp_id <- paste0("VP", sprintf("%03d", vp))
+  ecology <- data_person$condition_ecology[vp]
+  
+  # Wie viele Gesichter bekommen welche Valenz?
+  if (ecology == "realistic") {
+    n_trust <- n_trust_realistic  # 17
+    n_untrust <- n_untrust_realistic  # 7
+  } else {
+    n_trust <- n_trust_inverted  # 7
+    n_untrust <- n_untrust_inverted  # 17
+  }
+  
+  # Alle 24 Gesichter randomisieren
+  shuffled_faces <- sample(faces_old, n_old_items, replace = FALSE)
+  
+  # Erste n_trust Gesichter bekommen trustworthy Vignetten
+  trust_faces <- shuffled_faces[1:n_trust]
+  # Restliche bekommen untrustworthy Vignetten
+  untrust_faces <- shuffled_faces[(n_trust + 1):n_old_items]
+  
+  # Vignetten zuweisen (MIT WIEDERHOLUNG, weil wir nur 12 haben!)
+  # Das ist der Schlüssel: sample(..., replace = TRUE)
+  trust_vignettes_assigned <- sample(vignettes_trust, n_trust, replace = TRUE)
+  untrust_vignettes_assigned <- sample(vignettes_untrust, n_untrust, replace = TRUE)
+  
+  # Dataframe erstellen
+  vp_encoding <- data.frame(
+    vp_id = vp_id,
+    face_id = c(trust_faces, untrust_faces),
+    vignette_id = c(trust_vignettes_assigned, untrust_vignettes_assigned),
+    valence_encoded = c(
+      rep("trustworthy", n_trust),
+      rep("untrustworthy", n_untrust)
+    )
+  )
+  
+  encoding_trials <- rbind(encoding_trials, vp_encoding)
+}
+
+# Überprüfung: Verteilung pro Bedingung
+encoding_check <- encoding_trials %>%
+  left_join(data_person %>% select(vp_id, condition_ecology), by = "vp_id") %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    n_items_per_vp = n() / n_vp_per_condition,
+    .groups = "drop"
+  )
+
+cat("Encoding-Verteilung pro Bedingung (Items pro VP):\n")
+print(encoding_check)
+
+# Check: Werden Vignetten mehrfach verwendet?
+vignette_reuse <- encoding_trials %>%
+  group_by(vp_id, vignette_id) %>%
+  summarise(n_uses = n(), .groups = "drop") %>%
+  filter(n_uses > 1)
+
+cat("\nVignetten-Wiederverwendung:\n")
+cat("  - Vignetten mehrfach verwendet:", nrow(vignette_reuse), "Fälle\n")
+cat("  - Das ist KORREKT - wir haben nur 12 Vignetten pro Valenz!\n")
+```
+
+# Trial-Level Daten: Recognition Test
+
+Hier wird's spannend! Jede VP sieht:
+- Alle 24 alten Items (die sie in Encoding gesehen hat)
+- Alle 24 neuen Items (Distraktoren)
+- Total: 48 Trials
+
+```{r recognition}
+data_trial <- data.frame()
+
+for (vp in 1:n_vp_total) {
+  vp_id <- paste0("VP", sprintf("%03d", vp))
+  
+  # Person-Level Info
+  person_info <- data_person %>% filter(vp_id == !!vp_id)
+  ecology <- person_info$condition_ecology
+  vp_re_hit <- person_info$vp_re_hit
+  vp_re_source <- person_info$vp_re_source
+  
+  # LZO-Score berechnen
+  lzo_items_vp <- person_info %>% 
+    select(starts_with("lzo_item")) %>% 
+    as.numeric()
+  lzo_score <- mean(lzo_items_vp, na.rm = TRUE)
+  
+  # Welche Items hat diese VP in Encoding gesehen (mit Valenz-Info)?
+  old_items_vp <- encoding_trials %>%
+    filter(vp_id == !!vp_id)
+  
+  # Recognition Test: Alte Items
+  for (i in 1:nrow(old_items_vp)) {
+    face <- old_items_vp$face_id[i]
+    valence <- old_items_vp$valence_encoded[i]  # Valenz aus Encoding!
+    
+    # Item Random Effects (vom Gesicht)
+    item_re_info <- item_random_effects %>% filter(face_id == face)
+    item_re_hit <- item_re_info$item_re_hit
+    item_re_source <- item_re_info$item_re_source
+    
+    # --- HIT PROBABILITY ---
+    logit_hit <- qlogis(p_hit_baseline) + vp_re_hit + item_re_hit
+    p_hit <- plogis(logit_hit)
+    
+    # Simuliere Recognition Response
+    is_hit <- rbinom(1, size = 1, prob = p_hit)
+    recognition_response <- ifelse(is_hit == 1, "old", "new")
+    
+    # Recognition RT
+    recognition_rt <- rtruncnorm(1, 
+                                a = 300,  # Minimum
+                                b = 5000, # Maximum
+                                mean = rt_recognition_mean, 
+                                sd = rt_recognition_sd)
+    
+    # --- SOURCE MEMORY (nur wenn Hit) ---
+    if (is_hit == 1) {
+      # Kontrastkodierung
+      ecology_contrast <- ifelse(ecology == "realistic", -0.5, 0.5)
+      valence_contrast <- ifelse(valence == "trustworthy", -0.5, 0.5)
+      
+      # LZO zentrieren (an Grand Mean aller VPs)
+      lzo_grand_mean <- mean(rowMeans(data_person %>% select(starts_with("lzo_item"))))
+      lzo_centered <- lzo_score - lzo_grand_mean
+      
+      # Valenz-Effekt hängt von Ökologie ab (das ist die Interaktion!)
+      if (ecology == "realistic") {
+        valence_effect <- valence_contrast * cheater_advantage_logit
+      } else {  # inverted
+        valence_effect <- valence_contrast * rarity_reversal_logit
+      }
+      
+      # Source Memory auf Logit-Skala
+      logit_source <- qlogis(p_source_baseline) +
+                      vp_re_source +
+                      item_re_source +
+                      ecology_contrast * ecology_effect_logit +
+                      valence_effect +
+                      lzo_centered * lzo_main_effect_logit +
+                      ecology_contrast * valence_contrast * lzo_centered * lzo_interaction_logit
+      
+      p_source_correct <- plogis(logit_source)
+      
+      # Ist die Quellenzuordnung korrekt?
+      is_correct_source <- rbinom(1, size = 1, prob = p_source_correct)
+      
+      # Source Judgment: Wenn korrekt → richtige Valenz, sonst falsch
+      # Wir modellieren auch "weiß nicht" mit kleiner Wahrscheinlichkeit
+      p_dont_know <- 0.10
+      
+      if (runif(1) < p_dont_know) {
+        source_judgment <- "dont_know"
+      } else if (is_correct_source == 1) {
+        source_judgment <- valence  # Korrekte Zuordnung
+      } else {
+        # Falsche Zuordnung (andere Valenz)
+        source_judgment <- ifelse(valence == "trustworthy", 
+                                 "untrustworthy", 
+                                 "trustworthy")
+      }
+      
+      # Source Judgment RT
+      source_judgment_rt <- rtruncnorm(1,
+                                      a = 400,
+                                      b = 6000,
+                                      mean = rt_source_mean,
+                                      sd = rt_source_sd)
+      
+    } else {
+      # Kein Hit → kein Source Judgment
+      source_judgment <- NA
+      source_judgment_rt <- NA
+    }
+    
+    # Trial speichern
+    trial <- data.frame(
+      vp_id = vp_id,
+      face_id = face,
+      item_type = "old",
+      valence_encoded = valence,
+      recognition_response = recognition_response,
+      recognition_rt = round(recognition_rt),
+      source_judgment = source_judgment,
+      source_judgment_rt = round(source_judgment_rt)
+    )
+    
+    data_trial <- rbind(data_trial, trial)
+  }
+  
+  # Recognition Test: Neue Items (Distraktoren)
+  for (face in faces_new) {
+    item_info <- item_random_effects %>% filter(face_id == face)
+    item_re_hit <- item_info$item_re_hit
+    
+    # False Alarm Probability
+    logit_fa <- qlogis(p_fa_baseline) + vp_re_hit + item_re_hit
+    p_fa <- plogis(logit_fa)
+    
+    is_false_alarm <- rbinom(1, size = 1, prob = p_fa)
+    recognition_response <- ifelse(is_false_alarm == 1, "old", "new")
+    
+    recognition_rt <- rtruncnorm(1,
+                                a = 300,
+                                b = 5000,
+                                mean = rt_recognition_mean * 0.95,  # Etwas schneller bei "new"
+                                sd = rt_recognition_sd)
+    
+    # Neue Items haben keine Source (auch wenn fälschlich als "old" erkannt)
+    source_judgment <- NA
+    source_judgment_rt <- NA
+    
+    trial <- data.frame(
+      vp_id = vp_id,
+      face_id = face,
+      item_type = "new",
+      valence_encoded = NA,
+      recognition_response = recognition_response,
+      recognition_rt = round(recognition_rt),
+      source_judgment = source_judgment,
+      source_judgment_rt = round(source_judgment_rt)
+    )
+    
+    data_trial <- rbind(data_trial, trial)
+  }
+}
+
+# Trial-Order randomisieren (innerhalb jeder VP)
+data_trial <- data_trial %>%
+  group_by(vp_id) %>%
+  mutate(trial_number = sample(1:n(), n())) %>%
+  arrange(vp_id, trial_number) %>%
+  ungroup()
+
+glimpse(data_trial)
+```
+
+# Datenqualität prüfen
+
+```{r quality-checks}
+# 1. Anzahl Trials pro VP
+trials_per_vp <- data_trial %>%
+  count(vp_id) %>%
+  pull(n) %>%
+  unique()
+
+cat("Trials pro VP:", trials_per_vp, "(sollte 48 sein)\n\n")
+
+# 2. Hit Rates überprüfen
+hit_rates <- data_trial %>%
+  filter(item_type == "old") %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_items = n(),
+    n_hits = sum(recognition_response == "old"),
+    hit_rate = n_hits / n_items,
+    .groups = "drop"
+  )
+
+cat("Hit Rate Statistik:\n")
+print(summary(hit_rates$hit_rate))
+
+# 3. False Alarm Rate
+fa_rates <- data_trial %>%
+  filter(item_type == "new") %>%
+  group_by(vp_id) %>%
+  summarise(
+    n_new = n(),
+    n_fa = sum(recognition_response == "old"),
+    fa_rate = n_fa / n_new,
+    .groups = "drop"
+  )
+
+cat("\nFalse Alarm Rate Statistik:\n")
+print(summary(fa_rates$fa_rate))
+
+# 4. Source Memory Performance
+source_performance <- data_trial %>%
+  filter(item_type == "old", recognition_response == "old") %>%
+  mutate(correct_source = (source_judgment == valence_encoded)) %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_hits = n(),
+    n_correct_source = sum(correct_source, na.rm = TRUE),
+    source_accuracy = n_correct_source / n_hits,
+    .groups = "drop"
+  )
+
+cat("\nSource Memory Accuracy:\n")
+print(summary(source_performance$source_accuracy))
+
+# 5. Ökologie-Check
+ecology_check <- data_trial %>%
+  filter(item_type == "old") %>%
+  left_join(data_person %>% select(vp_id, condition_ecology), by = "vp_id") %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    n_items = n() / n_vp_per_condition,
+    .groups = "drop"
+  )
+
+cat("\nÖkologie-Verteilung (Items pro VP):\n")
+print(ecology_check)
+```
+
+# Visualisierung der simulierten Daten
+
+```{r plots, fig.width=12, fig.height=8}
+library(patchwork)
+
+# CSIM berechnen für Visualisierung
+csim_data <- data_trial %>%
+  filter(item_type == "old", recognition_response == "old") %>%
+  mutate(correct_source = (source_judgment == valence_encoded)) %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_hits = n(),
+    n_correct_source = sum(correct_source, na.rm = TRUE),
+    csim = n_correct_source / n_hits,
+    .groups = "drop"
+  ) %>%
+  left_join(data_person %>% select(vp_id, condition_ecology), by = "vp_id")
+
+# Plot 1: CSIM nach Bedingung
+p1 <- ggplot(csim_data, 
+             aes(x = valence_encoded, y = csim, fill = condition_ecology)) +
+  geom_violin(alpha = 0.3, position = position_dodge(0.9)) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9), alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3,
+               position = position_dodge(0.9), fill = "white") +
+  scale_fill_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c")) +
+  labs(title = "Simulated CSIM by Ecology and Valence",
+       subtitle = "Diamonds = means",
+       x = "Profile Valence",
+       y = "CSIM",
+       fill = "Ecology") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Plot 2: Hit Rates (sollten äquivalent sein)
+hit_plot_data <- data_trial %>%
+  filter(item_type == "old") %>%
+  mutate(is_hit = recognition_response == "old") %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(hit_rate = mean(is_hit), .groups = "drop") %>%
+  left_join(data_person %>% select(vp_id, condition_ecology), by = "vp_id")
+
+p2 <- ggplot(hit_plot_data,
+             aes(x = valence_encoded, y = hit_rate, fill = condition_ecology)) +
+  geom_violin(alpha = 0.3, position = position_dodge(0.9)) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9)) +
+  scale_fill_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c")) +
+  labs(title = "Hit Rates (should be equivalent)",
+       x = "Valence",
+       y = "Hit Rate") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Plot 3: Interaktionsplot
+interaction_data <- csim_data %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    csim_m = mean(csim, na.rm = TRUE),
+    csim_se = sd(csim, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p3 <- ggplot(interaction_data,
+             aes(x = valence_encoded, y = csim_m, 
+                 color = condition_ecology, group = condition_ecology)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = csim_m - csim_se, ymax = csim_m + csim_se),
+                width = 0.1) +
+  scale_color_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c")) +
+  labs(title = "Ecology × Valence Interaction",
+       subtitle = "Error bars = ±1 SE",
+       x = "Valence",
+       y = "Mean CSIM",
+       color = "Ecology") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Kombinieren
+(p1 | p2) / p3
+```
+
+# Daten exportieren
+
+```{r export}
+# Person-Level Daten (ohne Random Effects)
+data_person_export <- data_person %>%
+  select(-vp_re_hit, -vp_re_source)
+
+# Trial-Level Daten
+data_trial_export <- data_trial %>%
+  select(vp_id, face_id, item_type, valence_encoded,
+         recognition_response, recognition_rt,
+         source_judgment, source_judgment_rt, trial_number)
+
+# CSV exportieren
+write.csv(data_person_export, 
+          "data_person_level.csv", 
+          row.names = FALSE)
+
+write.csv(data_trial_export, 
+          "data_trial_level.csv", 
+          row.names = FALSE)
+
+cat("Daten erfolgreich exportiert!\n")
+cat("- data_person_level.csv:", nrow(data_person_export), "VPs\n")
+cat("- data_trial_level.csv:", nrow(data_trial_export), "Trials\n")
+```
+
+# Schnelltest mit dem Analyseskript
+
+Kurzer Test, ob die Daten mit dem Analyseskript kompatibel sind:
+
+```{r quick-test}
+# Daten einlesen (simuliert das Analyseskript)
+test_trial <- read.csv("data_trial_level.csv")
+test_person <- read.csv("data_person_level.csv")
+
+# Variablen berechnen wie im Analyseskript
+test_data <- test_trial %>%
+  mutate(
+    is_hit = (item_type == "old" & recognition_response == "old"),
+    is_false_alarm = (item_type == "new" & recognition_response == "old"),
+    is_correct_source = (is_hit & source_judgment == valence_encoded),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+# CSIM berechnen
+test_csim <- test_data %>%
+  filter(item_type == "old") %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_hits = sum(is_hit),
+    n_correct_source = sum(is_correct_source, na.rm = TRUE),
+    csim = n_correct_source / n_hits,
+    .groups = "drop"
+  )
+
+# Person-Level Info mergen
+test_csim <- test_csim %>%
+  left_join(test_person, by = "vp_id") %>%
+  mutate(
+    lzo_score = rowMeans(select(., starts_with("lzo_item")), na.rm = TRUE),
+    lzo_centered = lzo_score - mean(lzo_score),
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+
+# Einfaches LMM zum Testen
+library(lme4)
+library(lmerTest)
+
+model_test <- lmer(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         (1 | vp_id) + (1 | face_id),
+  data = test_csim
+)
+
+cat("\n=== Schnelltest: Modell-Summary ===\n")
+print(summary(model_test))
+
+cat("\n=== ANOVA Tabelle ===\n")
+print(anova(model_test))
+```
+
+# Zusammenfassung
+
+Die simulierten Daten sollten folgende Effekte zeigen:
+
+1. **H1 (Realistic Ecology)**: Cheater Advantage
+   - Untrustworthy profiles sollten bessere Source Memory haben als trustworthy
+
+2. **H2 (Inverted Ecology)**: Rarity Reversal  
+   - Trustworthy profiles sollten bessere Source Memory haben (Umkehrung!)
+
+3. **H3 (LZO Moderation)**: 
+   - Höhere LZO sollte Sensitivität für seltene Informationen verstärken
+
+**Nächste Schritte:**
+
+1. Diese Daten mit `analysis_pipeline.Rmd` analysieren
+2. Prüfen, ob alle Hypothesentests funktionieren
+3. Bei Bedarf Effektgrößen in der Simulation anpassen
+
+---
+
+**Session Info**
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,916 @@
+---
+title: "Source Memory Study: Informationsökologie & Beziehungsorientierung"
+subtitle: "Komplette Analysepipeline"
+author: "Ihr Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    highlight: tango
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+```
+
+# Pakete laden
+
+```{r packages}
+# Installation falls nötig (auskommentiert)
+# install.packages(c("tidyverse", "lme4", "lmerTest", "emmeans", 
+#                    "ggplot2", "performance", "see", "patchwork",
+#                    "knitr", "kableExtra", "psych", "car"))
+
+library(tidyverse)      # Datenmanipulation
+library(lme4)           # Linear Mixed Models
+library(lmerTest)       # p-Werte für LMMs
+library(emmeans)        # Marginal Means & Kontraste
+library(performance)    # Modelldiagnostik
+library(see)            # Visualisierung für performance
+library(ggplot2)        # Plots
+library(patchwork)      # Plot-Kombinationen
+library(knitr)          # Tabellen
+library(kableExtra)     # Schöne Tabellen
+library(psych)          # Deskriptive Statistik
+library(car)            # Levene-Test, VIF
+
+# Seed für Reproduzierbarkeit
+set.seed(42)
+```
+
+# Daten einlesen
+
+```{r load-data}
+# Trial-Level Daten
+data_raw <- read.csv("data_trial_level.csv", stringsAsFactors = FALSE)
+
+# Person-Level Daten
+data_person <- read.csv("data_person_level.csv", stringsAsFactors = FALSE)
+
+# Datenstruktur prüfen
+glimpse(data_raw)
+glimpse(data_person)
+```
+
+# Datenqualität & Ausschlüsse
+
+## Stichprobenbeschreibung (vor Ausschlüssen)
+
+```{r sample-description-raw}
+# Anzahl VPs
+n_vp_total <- length(unique(data_person$vp_id))
+
+# Demografische Daten
+demo_summary <- data_person %>%
+  summarise(
+    N = n(),
+    Age_M = mean(age, na.rm = TRUE),
+    Age_SD = sd(age, na.rm = TRUE),
+    Age_Min = min(age, na.rm = TRUE),
+    Age_Max = max(age, na.rm = TRUE)
+  )
+
+# Geschlechterverteilung
+gender_table <- data_person %>%
+  count(gender) %>%
+  mutate(Percent = round(n / sum(n) * 100, 1))
+
+# Bedingungszuweisung
+condition_table <- data_person %>%
+  count(condition_ecology) %>%
+  mutate(Percent = round(n / sum(n) * 100, 1))
+
+# Ausgabe
+kable(demo_summary, caption = "Demografische Statistik") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+kable(gender_table, caption = "Geschlechterverteilung") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+kable(condition_table, caption = "Bedingungszuweisung") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+## Ausschlusskriterien anwenden
+
+```{r exclusions}
+# 1. Unvollständige Daten
+data_person <- data_person %>%
+  filter(complete.cases(.))
+
+# 2. Zielgruppe verfehlt (Alter >35 oder in Beziehung)
+data_person <- data_person %>%
+  filter(
+    age >= 18 & age <= 35,
+    relationship_status %in% c("single", "Single")
+  )
+
+# 3. Careless Responding (Longstring auf LZO-Items)
+data_person <- data_person %>%
+  rowwise() %>%
+  mutate(
+    lzo_values = list(c(lzo_item_01, lzo_item_02, lzo_item_03, lzo_item_04, lzo_item_05,
+                        lzo_item_06, lzo_item_07, lzo_item_08, lzo_item_09, lzo_item_10)),
+    longest_string = max(rle(lzo_values)$lengths),
+    careless = longest_string >= 9  # 90% identische Antworten
+  ) %>%
+  ungroup() %>%
+  filter(careless == FALSE)
+
+# VPs nach Ausschlüssen
+vp_included <- data_person$vp_id
+
+# Trial-Daten auf inkludierte VPs reduzieren
+data_raw <- data_raw %>%
+  filter(vp_id %in% vp_included)
+
+# Ausschluss-Bericht
+n_excluded <- n_vp_total - length(vp_included)
+cat("Ausgeschlossen:", n_excluded, "VPs\n")
+cat("Inkludiert:", length(vp_included), "VPs\n")
+```
+
+## Reaktionszeit-Ausreißer (Trial-Ebene)
+
+```{r rt-outliers}
+# Individuelle RT-Cutoffs berechnen
+data_cleaned <- data_raw %>%
+  group_by(vp_id) %>%
+  mutate(
+    rt_mean = mean(recognition_rt, na.rm = TRUE),
+    rt_sd = sd(recognition_rt, na.rm = TRUE),
+    rt_cutoff_upper = rt_mean + 3 * rt_sd,
+    rt_valid = recognition_rt >= 300 & recognition_rt <= rt_cutoff_upper
+  ) %>%
+  ungroup()
+
+# Anzahl ausgeschlossener Trials
+n_trials_excluded <- sum(!data_cleaned$rt_valid)
+n_trials_total <- nrow(data_cleaned)
+
+cat("Ausgeschlossene Trials (RT-Ausreißer):", n_trials_excluded, 
+    "(", round(n_trials_excluded/n_trials_total*100, 2), "%)\n")
+
+# Nur valide Trials behalten
+data_cleaned <- data_cleaned %>%
+  filter(rt_valid == TRUE)
+```
+
+## Missing Data Diagnose
+
+```{r missing-data}
+# Little's MCAR Test (auf relevanten Variablen)
+# Hinweis: Forced-Response sollte Missing minimieren
+
+missing_pattern <- data_cleaned %>%
+  select(recognition_response, source_judgment) %>%
+  summarise(
+    n_total = n(),
+    missing_recog = sum(is.na(recognition_response)),
+    missing_source = sum(is.na(source_judgment))
+  )
+
+kable(missing_pattern, caption = "Missing Data Pattern") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Variablen berechnen
+
+## Binäre Outcomes
+
+```{r binary-outcomes}
+data_cleaned <- data_cleaned %>%
+  mutate(
+    # Hit: altes Item korrekt als "old" erkannt
+    is_hit = (item_type == "old" & recognition_response == "old"),
+    
+    # False Alarm: neues Item fälschlich als "old" erkannt
+    is_false_alarm = (item_type == "new" & recognition_response == "old"),
+    
+    # Correct Source: Hit + korrekte Quellenzuordnung
+    is_correct_source = (is_hit & source_judgment == valence_encoded),
+    
+    # Kodierung für Analyse
+    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5)
+  )
+```
+
+## LZO-Score & Zentrierung
+
+```{r lzo-score}
+data_person <- data_person %>%
+  mutate(
+    # LZO-Mittelwert über alle Items
+    lzo_score = rowMeans(select(., starts_with("lzo_item")), na.rm = TRUE)
+  )
+
+# Grand-Mean-Zentrierung
+lzo_grand_mean <- mean(data_person$lzo_score, na.rm = TRUE)
+
+data_person <- data_person %>%
+  mutate(
+    lzo_centered = lzo_score - lzo_grand_mean,
+    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5)
+  )
+
+# Cronbach's Alpha für LZO-Skala
+lzo_items <- data_person %>% select(starts_with("lzo_item"))
+alpha_lzo <- psych::alpha(lzo_items)
+cat("Cronbach's Alpha (LZO):", round(alpha_lzo$total$raw_alpha, 3), "\n")
+```
+
+# Deskriptive Statistiken
+
+## CSIM-Berechnung
+
+```{r csim-calculation}
+# CSIM: Conditional Source Identification Measure
+# Anteil korrekter Quellenzuordnungen bei Hits
+data_csim <- data_cleaned %>%
+  filter(item_type == "old") %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_old_items = n(),
+    n_hits = sum(is_hit),
+    n_correct_source = sum(is_correct_source, na.rm = TRUE),
+    csim = n_correct_source / n_hits,
+    .groups = "drop"
+  )
+
+# Überprüfung: CSIM sollte zwischen 0 und 1 liegen
+summary(data_csim$csim)
+```
+
+## Hit Rate & False Alarm Rate
+
+```{r recognition-measures}
+# Hit Rate pro VP und Valenz
+data_hits <- data_cleaned %>%
+  filter(item_type == "old") %>%
+  group_by(vp_id, valence_encoded) %>%
+  summarise(
+    n_old = n(),
+    n_hits = sum(is_hit),
+    hit_rate = n_hits / n_old,
+    .groups = "drop"
+  )
+
+# False Alarm Rate pro VP (über alle neuen Items)
+data_fa <- data_cleaned %>%
+  filter(item_type == "new") %>%
+  group_by(vp_id) %>%
+  summarise(
+    n_new = n(),
+    n_fa = sum(is_false_alarm),
+    false_alarm_rate = n_fa / n_new,
+    .groups = "drop"
+  )
+```
+
+## d' (Sensitivität)
+
+```{r d-prime}
+# d' berechnen (mit log-linear Korrektur für 0 und 1)
+data_dprime <- data_hits %>%
+  left_join(data_fa, by = "vp_id") %>%
+  mutate(
+    # Log-linear Korrektur
+    n_old_total = 12,  # 12 Items pro Valenzbedingung
+    n_new_total = 24,  # 24 neue Items insgesamt
+    
+    hit_rate_adj = case_when(
+      hit_rate == 1 ~ 1 - 1/(2*n_old_total),
+      hit_rate == 0 ~ 1/(2*n_old_total),
+      TRUE ~ hit_rate
+    ),
+    
+    fa_rate_adj = case_when(
+      false_alarm_rate == 1 ~ 1 - 1/(2*n_new_total),
+      false_alarm_rate == 0 ~ 1/(2*n_new_total),
+      TRUE ~ false_alarm_rate
+    ),
+    
+    # d' = Z(Hit Rate) - Z(False Alarm Rate)
+    d_prime = qnorm(hit_rate_adj) - qnorm(fa_rate_adj)
+  )
+```
+
+## Datensatz zusammenführen
+
+```{r merge-data}
+# Alle berechneten Maße zusammenführen
+data_analysis <- data_csim %>%
+  left_join(data_dprime, by = c("vp_id", "valence_encoded")) %>%
+  left_join(data_person, by = "vp_id")
+
+# Finale Stichprobe
+cat("Finale Stichprobe:", length(unique(data_analysis$vp_id)), "VPs\n")
+cat("Datenpunkte für Analyse:", nrow(data_analysis), "(2 pro VP)\n")
+
+# Speichern
+write.csv(data_analysis, "data_csim_aggregated.csv", row.names = FALSE)
+```
+
+## Deskriptive Tabelle
+
+```{r descriptives-table}
+desc_stats <- data_analysis %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    N = n(),
+    CSIM_M = mean(csim, na.rm = TRUE),
+    CSIM_SD = sd(csim, na.rm = TRUE),
+    HitRate_M = mean(hit_rate, na.rm = TRUE),
+    HitRate_SD = sd(hit_rate, na.rm = TRUE),
+    dPrime_M = mean(d_prime, na.rm = TRUE),
+    dPrime_SD = sd(d_prime, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+kable(desc_stats, caption = "Deskriptive Statistiken nach Bedingung") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  column_spec(1:2, bold = TRUE)
+```
+
+# Visualisierungen
+
+## CSIM nach Bedingung
+
+```{r plot-csim-conditions, fig.height=6, fig.width=10}
+# Violin Plot mit Einzelpunkten
+p1 <- ggplot(data_analysis, 
+             aes(x = valence_encoded, y = csim, fill = condition_ecology)) +
+  geom_violin(alpha = 0.3, position = position_dodge(0.9)) +
+  geom_boxplot(width = 0.2, position = position_dodge(0.9), alpha = 0.7) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.9),
+              alpha = 0.3, size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, 
+               position = position_dodge(0.9), color = "black", fill = "white") +
+  scale_fill_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c"),
+                    labels = c("Realistic Ecology (70:30)", "Inverted Ecology (30:70)")) +
+  scale_x_discrete(labels = c("trustworthy" = "Trustworthy", 
+                              "untrustworthy" = "Untrustworthy")) +
+  labs(
+    title = "Source Memory (CSIM) by Ecology and Valence",
+    subtitle = "Diamonds = means, boxes = quartiles, violins = distribution",
+    x = "Profile Valence",
+    y = "CSIM (Conditional Source Identification)",
+    fill = "Ecology Condition"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+print(p1)
+```
+
+## Interaktionsplot
+
+```{r plot-interaction, fig.height=6, fig.width=8}
+# Mittelwerte für Interaktionsplot
+means_interaction <- data_analysis %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    CSIM_M = mean(csim, na.rm = TRUE),
+    CSIM_SE = sd(csim, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+p2 <- ggplot(means_interaction, 
+             aes(x = valence_encoded, y = CSIM_M, 
+                 color = condition_ecology, group = condition_ecology)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = CSIM_M - CSIM_SE, ymax = CSIM_M + CSIM_SE),
+                width = 0.1, size = 1) +
+  scale_color_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c"),
+                     labels = c("Realistic (70:30)", "Inverted (30:70)")) +
+  scale_x_discrete(labels = c("trustworthy" = "Trustworthy", 
+                              "untrustworthy" = "Untrustworthy")) +
+  labs(
+    title = "Ecology × Valence Interaction",
+    subtitle = "Error bars = ±1 SE",
+    x = "Profile Valence",
+    y = "Mean CSIM",
+    color = "Ecology"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.title = element_text(face = "bold")
+  )
+
+print(p2)
+```
+
+## LZO-Verteilung
+
+```{r plot-lzo, fig.height=5, fig.width=8}
+p3 <- ggplot(data_person, aes(x = lzo_score)) +
+  geom_histogram(aes(y = ..density..), bins = 20, fill = "#95a5a6", alpha = 0.7) +
+  geom_density(color = "#2c3e50", size = 1.2) +
+  geom_vline(xintercept = lzo_grand_mean, linetype = "dashed", 
+             color = "#e74c3c", size = 1) +
+  annotate("text", x = lzo_grand_mean + 0.3, y = 0.5, 
+           label = paste("M =", round(lzo_grand_mean, 2)),
+           color = "#e74c3c", fontface = "bold") +
+  labs(
+    title = "Distribution of Long-Term Orientation (LZO)",
+    x = "LZO Score (1-7)",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p3)
+```
+
+# Voraussetzungsprüfung
+
+## Normalverteilung (CSIM)
+
+```{r assumptions-normality}
+# Shapiro-Wilk Test pro Gruppe
+normality_tests <- data_analysis %>%
+  group_by(condition_ecology, valence_encoded) %>%
+  summarise(
+    N = n(),
+    Shapiro_W = shapiro.test(csim)$statistic,
+    Shapiro_p = shapiro.test(csim)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(Shapiro_W, Shapiro_p), ~round(., 4)))
+
+kable(normality_tests, caption = "Shapiro-Wilk Tests für Normalverteilung") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Q-Q Plots
+par(mfrow = c(2, 2))
+for(eco in unique(data_analysis$condition_ecology)) {
+  for(val in unique(data_analysis$valence_encoded)) {
+    subset_data <- data_analysis %>%
+      filter(condition_ecology == eco, valence_encoded == val)
+    
+    qqnorm(subset_data$csim, main = paste(eco, "-", val))
+    qqline(subset_data$csim, col = "red")
+  }
+}
+par(mfrow = c(1, 1))
+```
+
+## Varianzhomogenität
+
+```{r assumptions-homogeneity}
+# Levene-Test (für Between-Faktor)
+levene_test <- car::leveneTest(csim ~ condition_ecology, data = data_analysis)
+print(levene_test)
+
+# Boxplots zur visuellen Inspektion
+ggplot(data_analysis, aes(x = interaction(valence_encoded, condition_ecology), 
+                          y = csim, fill = condition_ecology)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c")) +
+  labs(
+    title = "Variance Homogeneity Check",
+    x = "Condition",
+    y = "CSIM"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Ausreißer (Mahalanobis-Distanz)
+
+```{r outliers-mahalanobis}
+# Für multivariate Ausreißer: CSIM für beide Valenzbedingungen
+data_wide <- data_analysis %>%
+  select(vp_id, valence_encoded, csim, condition_ecology) %>%
+  pivot_wider(names_from = valence_encoded, values_from = csim, 
+              names_prefix = "csim_")
+
+# Mahalanobis-Distanz
+csim_matrix <- data_wide %>% 
+  select(starts_with("csim_")) %>%
+  na.omit()
+
+if(nrow(csim_matrix) > 0) {
+  mahal_dist <- mahalanobis(
+    csim_matrix,
+    center = colMeans(csim_matrix),
+    cov = cov(csim_matrix)
+  )
+  
+  # Chi-Quadrat-Kriterium (df = 2 für 2 Variablen)
+  cutoff <- qchisq(0.999, df = 2)
+  
+  outliers <- which(mahal_dist > cutoff)
+  
+  cat("Multivariate Outliers (p < .001):", length(outliers), "\n")
+  if(length(outliers) > 0) {
+    cat("VP IDs:", data_wide$vp_id[outliers], "\n")
+  }
+}
+```
+
+# Hauptanalyse: Linear Mixed Models
+
+## Modell-Spezifikation
+
+```{r lmm-model}
+# Maximale Struktur (gemäß Präregistrierung)
+model_full <- lmer(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         (1 + valence_contrast | vp_id) +
+         (1 | face_id),
+  data = data_analysis,
+  control = lmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+# Konvergenz-Check
+if(isSingular(model_full)) {
+  cat("WARNING: Singular fit detected. Trying reduced model...\n")
+  
+  # Reduzierte Struktur: Korrelation zwischen Random Effects entfernen
+  model_reduced <- lmer(
+    csim ~ ecology_contrast * valence_contrast * lzo_centered +
+           (1 + valence_contrast || vp_id) +  # || statt |
+           (1 | face_id),
+    data = data_analysis,
+    control = lmerControl(
+      optimizer = "bobyqa",
+      optCtrl = list(maxfun = 100000)
+    )
+  )
+  
+  if(isSingular(model_reduced)) {
+    cat("Still singular. Using simplest structure...\n")
+    model_final <- lmer(
+      csim ~ ecology_contrast * valence_contrast * lzo_centered +
+             (1 | vp_id) +
+             (1 | face_id),
+      data = data_analysis,
+      control = lmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 100000)
+      )
+    )
+  } else {
+    model_final <- model_reduced
+  }
+} else {
+  model_final <- model_full
+}
+
+# Model Summary
+summary(model_final)
+```
+
+## Modelldiagnostik
+
+```{r lmm-diagnostics, fig.height=8, fig.width=10}
+# Performance-Paket für umfassende Diagnostik
+check_model(model_final)
+```
+
+## Fixed Effects
+
+```{r lmm-fixed-effects}
+# ANOVA Tabelle (Type III)
+anova_table <- anova(model_final, type = "III")
+print(anova_table)
+
+# Als schöne Tabelle
+anova_df <- as.data.frame(anova_table)
+anova_df$Effect <- rownames(anova_df)
+anova_df <- anova_df %>%
+  select(Effect, everything()) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+kable(anova_df, caption = "ANOVA Type III Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(anova_df$`Pr(>F)` < 0.05), bold = TRUE, color = "red")
+```
+
+## Hypothesentests
+
+### H1 & H2: Ecology × Valence Interaktion
+
+```{r hypothesis-h1-h2}
+# Estimated Marginal Means
+emm_ecology_valence <- emmeans(model_final, 
+                               ~ valence_encoded | condition_ecology)
+
+# Kontraste innerhalb jeder Ökologie
+contrasts_within_ecology <- contrast(emm_ecology_valence, 
+                                     method = "pairwise",
+                                     adjust = "none")  # Keine Korrektur, da präregistriert
+
+print("=== Pairwise Contrasts within Ecology ===")
+print(contrasts_within_ecology)
+
+# H1: Realistic Ecology - untrustworthy > trustworthy
+h1_contrast <- contrast(
+  emmeans(model_final, ~ valence_encoded | condition_ecology,
+          at = list(condition_ecology = "realistic")),
+  list(cheater_advantage = c(trustworthy = -1, untrustworthy = 1)),
+  side = ">"
+)
+
+print("=== H1: Realistic Ecology (Cheater Advantage) ===")
+print(h1_contrast)
+
+# H2: Inverted Ecology - trustworthy > untrustworthy (Umkehrung)
+h2_contrast <- contrast(
+  emmeans(model_final, ~ valence_encoded | condition_ecology,
+          at = list(condition_ecology = "inverted")),
+  list(rarity_advantage = c(trustworthy = 1, untrustworthy = -1)),
+  side = ">"
+)
+
+print("=== H2: Inverted Ecology (Rarity Advantage) ===")
+print(h2_contrast)
+```
+
+### H3: Moderation durch LZO
+
+```{r hypothesis-h3}
+# Dreifach-Interaktion aus ANOVA
+three_way_p <- anova_table["ecology_contrast:valence_contrast:lzo_centered", "Pr(>F)"]
+
+cat("H3: Three-way Interaction p-value =", round(three_way_p, 4), "\n")
+
+if(three_way_p < 0.05) {
+  # Simple Slopes für LZO
+  emtrends_lzo <- emtrends(model_final, 
+                           ~ ecology_contrast | valence_contrast, 
+                           var = "lzo_centered")
+  
+  print("=== Simple Slopes for LZO ===")
+  print(emtrends_lzo)
+  
+  # Visualisierung der Moderation
+  lzo_values <- c(-1, 0, 1)  # -1 SD, Mean, +1 SD
+  
+  pred_data <- expand.grid(
+    ecology_contrast = c(-0.5, 0.5),
+    valence_contrast = c(-0.5, 0.5),
+    lzo_centered = lzo_values
+  )
+  
+  pred_data$csim_pred <- predict(model_final, newdata = pred_data, re.form = NA)
+  
+  pred_data <- pred_data %>%
+    mutate(
+      condition_ecology = ifelse(ecology_contrast == -0.5, "realistic", "inverted"),
+      valence_encoded = ifelse(valence_contrast == -0.5, "trustworthy", "untrustworthy"),
+      LZO_Level = factor(lzo_centered, 
+                        levels = lzo_values,
+                        labels = c("Low (-1 SD)", "Mean", "High (+1 SD)"))
+    )
+  
+  p_moderation <- ggplot(pred_data, 
+                        aes(x = valence_encoded, y = csim_pred, 
+                            color = condition_ecology, group = condition_ecology)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    facet_wrap(~ LZO_Level) +
+    scale_color_manual(values = c("realistic" = "#3498db", "inverted" = "#e74c3c")) +
+    labs(
+      title = "Three-Way Interaction: Ecology × Valence × LZO",
+      x = "Valence",
+      y = "Predicted CSIM",
+      color = "Ecology"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_moderation)
+}
+```
+
+## Effektstärken
+
+```{r effect-sizes}
+# R² (Marginal & Conditional)
+r2_values <- performance::r2(model_final)
+cat("Marginal R² (Fixed Effects only):", round(r2_values$R2_marginal, 3), "\n")
+cat("Conditional R² (Fixed + Random Effects):", round(r2_values$R2_conditional, 3), "\n")
+
+# Partielles Eta² für Fixed Effects (approximativ)
+# Wird aus F-Werten berechnet
+anova_df <- as.data.frame(anova_table)
+anova_df$eta_sq_partial <- anova_df$`F value` * anova_df$NumDF / 
+  (anova_df$`F value` * anova_df$NumDF + anova_df$DenDF)
+
+anova_df_eta <- anova_df %>%
+  select(Effect = rownames(.), `F value`, `Pr(>F)`, eta_sq_partial) %>%
+  mutate(across(where(is.numeric), ~round(., 4)))
+
+kable(anova_df_eta, caption = "Partial Eta² for Fixed Effects") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# Robustheitsanalysen
+
+## Äquivalenztest: Item Memory
+
+```{r equivalence-hit-rate}
+# Prüfung, ob Hit Rates zwischen Valenzbedingungen äquivalent sind
+# Äquivalenzgrenze: SESOI = 0.1 (10% Unterschied)
+
+hit_rate_comparison <- data_analysis %>%
+  select(vp_id, valence_encoded, hit_rate) %>%
+  pivot_wider(names_from = valence_encoded, 
+              values_from = hit_rate,
+              names_prefix = "hit_rate_")
+
+# Paired t-test
+t_test_hits <- t.test(hit_rate_comparison$hit_rate_trustworthy,
+                     hit_rate_comparison$hit_rate_untrustworthy,
+                     paired = TRUE)
+
+cat("Hit Rate Comparison (Trustworthy vs. Untrustworthy):\n")
+cat("t =", round(t_test_hits$statistic, 3), 
+    ", p =", round(t_test_hits$p.value, 4), "\n")
+cat("Mean difference =", round(t_test_hits$estimate, 3), "\n")
+
+# Visualisierung
+ggplot(data_analysis, aes(x = valence_encoded, y = hit_rate, fill = valence_encoded)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, alpha = 0.7) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "white") +
+  labs(
+    title = "Hit Rates by Valence (Equivalence Check)",
+    subtitle = paste("Paired t-test: p =", round(t_test_hits$p.value, 4)),
+    x = "Valence",
+    y = "Hit Rate"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Sensitivitätsanalyse: Kovariaten
+
+```{r sensitivity-covariates}
+# Modell mit Age und Gender als Kovariaten
+model_covariates <- lmer(
+  csim ~ ecology_contrast * valence_contrast * lzo_centered +
+         age + gender +
+         (1 | vp_id) +
+         (1 | face_id),
+  data = data_analysis,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+)
+
+# Vergleich der Haupteffekte
+cat("=== Comparison: With vs. Without Covariates ===\n")
+cat("\nOriginal Model:\n")
+print(anova(model_final, type = "III"))
+
+cat("\nWith Covariates:\n")
+print(anova(model_covariates, type = "III"))
+```
+
+## Alternative DV: d' (Signal Detection)
+
+```{r robustness-dprime}
+# Gleiche Analyse mit d' statt CSIM
+model_dprime <- lmer(
+  d_prime ~ ecology_contrast * valence_contrast * lzo_centered +
+            (1 | vp_id) +
+            (1 | face_id),
+  data = data_analysis,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+)
+
+cat("=== Analysis with d' as DV ===\n")
+print(anova(model_dprime, type = "III"))
+
+# Korrelation zwischen CSIM und d'
+cor_csim_dprime <- cor.test(data_analysis$csim, data_analysis$d_prime)
+cat("\nCorrelation CSIM - d':", round(cor_csim_dprime$estimate, 3), 
+    "(p =", round(cor_csim_dprime$p.value, 4), ")\n")
+```
+
+# Explorative Analysen
+
+## Geschlechtseffekte
+
+```{r exploratory-gender}
+# Modell mit Gender-Interaktion (explorativ!)
+model_gender <- lmer(
+  csim ~ ecology_contrast * valence_contrast * gender +
+         (1 | vp_id) +
+         (1 | face_id),
+  data = data_analysis,
+  control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+)
+
+cat("=== EXPLORATORY: Gender Effects ===\n")
+print(anova(model_gender, type = "III"))
+```
+
+## RT-Analysen
+
+```{r exploratory-rt}
+# Mittlere RTs für Source Judgments
+rt_analysis <- data_cleaned %>%
+  filter(item_type == "old", is_hit == TRUE) %>%
+  group_by(vp_id, valence_encoded, is_correct_source) %>%
+  summarise(
+    mean_rt = mean(source_judgment_rt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# RT-Unterschied: korrekt vs. inkorrekt
+rt_plot <- ggplot(rt_analysis, 
+                  aes(x = is_correct_source, y = mean_rt, fill = valence_encoded)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.3, position = position_dodge(0.9)) +
+  labs(
+    title = "Response Times for Source Judgments (Exploratory)",
+    x = "Correct Source Attribution",
+    y = "Mean RT (ms)"
+  ) +
+  theme_minimal()
+
+print(rt_plot)
+```
+
+# Zusammenfassung der Ergebnisse
+
+```{r results-summary}
+# Ergebnis-Tabelle erstellen
+results_summary <- data.frame(
+  Hypothesis = c("H1: Realistic Ecology (Cheater > Trustworthy)",
+                 "H2: Inverted Ecology (Rarity Reversal)",
+                 "H3: Moderation by LZO"),
+  Test = c("One-sided contrast",
+           "One-sided contrast",
+           "Three-way interaction"),
+  Result = c(
+    ifelse(exists("h1_contrast"), 
+           paste("t =", round(summary(h1_contrast)$t.ratio, 2),
+                 ", p =", round(summary(h1_contrast)$p.value, 4)),
+           "Not computed"),
+    ifelse(exists("h2_contrast"),
+           paste("t =", round(summary(h2_contrast)$t.ratio, 2),
+                 ", p =", round(summary(h2_contrast)$p.value, 4)),
+           "Not computed"),
+    ifelse(exists("three_way_p"),
+           paste("F =", round(anova_table["ecology_contrast:valence_contrast:lzo_centered", "F value"], 2),
+                 ", p =", round(three_way_p, 4)),
+           "Not computed")
+  ),
+  Supported = c(
+    ifelse(exists("h1_contrast"), 
+           ifelse(summary(h1_contrast)$p.value < 0.05, "Yes", "No"),
+           "—"),
+    ifelse(exists("h2_contrast"),
+           ifelse(summary(h2_contrast)$p.value < 0.05, "Yes", "No"),
+           "—"),
+    ifelse(exists("three_way_p"),
+           ifelse(three_way_p < 0.05, "Yes", "No"),
+           "—")
+  )
+)
+
+kable(results_summary, caption = "Summary of Hypothesis Tests") %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  row_spec(which(results_summary$Supported == "Yes"), 
+           bold = TRUE, color = "darkgreen")
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+---
+
+**Analysescript abgeschlossen am `r Sys.time()`**
