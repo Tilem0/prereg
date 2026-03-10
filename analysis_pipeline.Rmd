@@ -548,17 +548,21 @@ data_trial_hits <- data_cleaned %>%
   mutate(
     # Compute LZO centered at grand mean
     lzo_centered = lzo_score - mean(data_person$lzo_score, na.rm = TRUE),
-    # Contrast coding
-    ecology_contrast = ifelse(condition_ecology == "realistic", -0.5, 0.5),
-    valence_contrast = ifelse(valence_encoded == "trustworthy", -0.5, 0.5),
+    # Factor coding for emmeans compatibility
+    valence_encoded = factor(valence_encoded, levels = c("trustworthy", "untrustworthy")),
+    condition_ecology = factor(condition_ecology, levels = c("realistic", "inverted")),
     # Binary DV: correct source (0/1)
     correct_source = as.numeric(is_correct_source)
   )
 
+# Set deviation contrasts (-0.5/0.5) so coefficients match preregistered contrast coding
+contrasts(data_trial_hits$valence_encoded) <- contr.sum(2) / 2
+contrasts(data_trial_hits$condition_ecology) <- contr.sum(2) / 2
+
 # Maximale Struktur (gemäß Präregistrierung): trial-level GLMM with binomial family
 model_full <- glmer(
-  correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
-         (1 + valence_contrast | vp_id) +
+  correct_source ~ condition_ecology * valence_encoded * lzo_centered +
+         (1 + valence_encoded | vp_id) +
          (1 | face_id),
   data = data_trial_hits,
   family = binomial(link = "logit"),
@@ -574,8 +578,8 @@ if(isSingular(model_full)) {
   
   # Reduzierte Struktur: Korrelation zwischen Random Effects entfernen
   model_reduced <- glmer(
-    correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
-           (1 + valence_contrast || vp_id) +  # || statt |
+    correct_source ~ condition_ecology * valence_encoded * lzo_centered +
+           (1 + valence_encoded || vp_id) +  # || statt |
            (1 | face_id),
     data = data_trial_hits,
     family = binomial(link = "logit"),
@@ -588,7 +592,7 @@ if(isSingular(model_full)) {
   if(isSingular(model_reduced)) {
     cat("Still singular. Trying without random slope...\n")
     model_noslope <- glmer(
-      correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
+      correct_source ~ condition_ecology * valence_encoded * lzo_centered +
              (1 | vp_id) +
              (1 | face_id),
       data = data_trial_hits,
@@ -602,7 +606,7 @@ if(isSingular(model_full)) {
     if(isSingular(model_noslope)) {
       cat("Still singular. Using simplest structure (vp_id only)...\n")
       model_final <- glmer(
-        correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
+        correct_source ~ condition_ecology * valence_encoded * lzo_centered +
                (1 | vp_id),
         data = data_trial_hits,
         family = binomial(link = "logit"),
@@ -699,7 +703,7 @@ print(h2_contrast)
 ```{r hypothesis-h3}
 # Dreifach-Interaktion aus ANOVA (car::Anova returns Pr(>Chisq) for GLMMs)
 # Find the three-way interaction row by matching the name
-three_way_row <- grep("ecology_contrast:valence_contrast:lzo_centered", rownames(anova_table), value = TRUE)
+three_way_row <- grep("condition_ecology:valence_encoded:lzo_centered", rownames(anova_table), value = TRUE)
 if (length(three_way_row) > 0) {
   three_way_p <- anova_table[three_way_row, "Pr(>Chisq)"]
 } else {
@@ -711,7 +715,7 @@ cat("H3: Three-way Interaction p-value =", round(three_way_p, 4), "\n")
 if(!is.na(three_way_p) && three_way_p < 0.05) {
   # Simple Slopes für LZO
   emtrends_lzo <- emtrends(model_final, 
-                           ~ ecology_contrast | valence_contrast, 
+                           ~ condition_ecology | valence_encoded, 
                            var = "lzo_centered")
   
   print("=== Simple Slopes for LZO ===")
@@ -721,18 +725,20 @@ if(!is.na(three_way_p) && three_way_p < 0.05) {
   lzo_values <- c(-1, 0, 1)  # -1 SD, Mean, +1 SD
   
   pred_data <- expand.grid(
-    ecology_contrast = c(-0.5, 0.5),
-    valence_contrast = c(-0.5, 0.5),
+    condition_ecology = factor(c("realistic", "inverted"), levels = c("realistic", "inverted")),
+    valence_encoded = factor(c("trustworthy", "untrustworthy"), levels = c("trustworthy", "untrustworthy")),
     lzo_centered = lzo_values
   )
+  
+  # Set same contrasts as in the model data
+  contrasts(pred_data$condition_ecology) <- contr.sum(2) / 2
+  contrasts(pred_data$valence_encoded) <- contr.sum(2) / 2
   
   # Predict on response scale (probabilities)
   pred_data$prob_pred <- predict(model_final, newdata = pred_data, type = "response", re.form = NA)
   
   pred_data <- pred_data %>%
     mutate(
-      condition_ecology = ifelse(ecology_contrast == -0.5, "realistic", "inverted"),
-      valence_encoded = ifelse(valence_contrast == -0.5, "trustworthy", "untrustworthy"),
       LZO_Level = factor(lzo_centered, 
                         levels = lzo_values,
                         labels = c("Low (-1 SD)", "Mean", "High (+1 SD)"))
@@ -832,7 +838,7 @@ ggplot(data_analysis, aes(x = valence_encoded, y = hit_rate, fill = valence_enco
 ```{r sensitivity-covariates}
 # Modell mit Age und Gender als Kovariaten (GLMM on trial-level data)
 model_covariates <- glmer(
-  correct_source ~ ecology_contrast * valence_contrast * lzo_centered +
+  correct_source ~ condition_ecology * valence_encoded * lzo_centered +
          age + gender +
          (1 | vp_id) +
          (1 | face_id),
@@ -855,8 +861,17 @@ print(car::Anova(model_covariates, type = "III"))
 ```{r robustness-dprime}
 # Gleiche Analyse mit d' statt CSIM
 # d' is aggregated per VP × Valence, so no face_id random effect
+# Prepare factor variables with deviation contrasts for data_analysis
+data_analysis <- data_analysis %>%
+  mutate(
+    valence_encoded = factor(valence_encoded, levels = c("trustworthy", "untrustworthy")),
+    condition_ecology = factor(condition_ecology, levels = c("realistic", "inverted"))
+  )
+contrasts(data_analysis$valence_encoded) <- contr.sum(2) / 2
+contrasts(data_analysis$condition_ecology) <- contr.sum(2) / 2
+
 model_dprime <- lmer(
-  d_prime ~ ecology_contrast * valence_contrast * lzo_centered +
+  d_prime ~ condition_ecology * valence_encoded * lzo_centered +
             (1 | vp_id),
   data = data_analysis,
   control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
@@ -878,7 +893,7 @@ cat("\nCorrelation CSIM - d':", round(cor_csim_dprime$estimate, 3),
 ```{r exploratory-gender}
 # Modell mit Gender-Interaktion (explorativ!) - use GLMM on trial-level data
 model_gender <- glmer(
-  correct_source ~ ecology_contrast * valence_contrast * gender +
+  correct_source ~ condition_ecology * valence_encoded * gender +
          (1 | vp_id) +
          (1 | face_id),
   data = data_trial_hits,
@@ -941,7 +956,7 @@ results_summary <- data.frame(
                  ", p =", round(summary(h2_contrast)$p.value, 4)),
            "Not computed"),
     ifelse(exists("three_way_p"),
-           paste("F =", round(anova_table["ecology_contrast:valence_contrast:lzo_centered", "F value"], 2),
+           paste("Chisq =", round(anova_table["condition_ecology:valence_encoded:lzo_centered", "Chisq"], 2),
                  ", p =", round(three_way_p, 4)),
            "Not computed")
   ),
